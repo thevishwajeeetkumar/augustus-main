@@ -1,6 +1,6 @@
 #!/Users/sobhamodi/augustus-main/augustus-main/august/bin/python3
 import sys
-from langsmith.cli.main import main
+from scripts.repl import main
 if __name__ == '__main__':
     if sys.argv[0].endswith('.exe'):
         sys.argv[0] = sys.argv[0][:-4]
