@@ -1,59 +1,40 @@
-# --- FastAPI & server ---
-fastapi>=0.110,<0.115
-uvicorn[standard]>=0.23
+# --- API server stack (FastAPI docs recommend pinning the minor release) ---
+fastapi>=0.112.0,<0.113.0
+uvicorn[standard]>=0.30.0,<0.31.0
 
-# --- Database (SQLAlchemy + Postgres driver) ---
-SQLAlchemy>=2.0
-psycopg2-binary>=2.9
+# --- Configuration ---
+python-dotenv>=1.0.1,<2.0.0
 
-# --- LangChain core + split packages (kept <0.3 for legacy imports) ---
-langchain>=0.2.10,<0.3.0 ; python_version < "3.13"
-langchain-core>=0.2.10,<0.3.0 ; python_version < "3.13"
-langchain-openai>=0.1.7,<0.2.0 ; python_version < "3.13"
-langchain-text-splitters>=0.2.2,<0.3.0 ; python_version < "3.13"
-langchain-experimental>=0.0.57,<0.3.0 ; python_version < "3.13"
-langchain-pinecone>=0.2.3,<0.3.0 ; python_version < "3.13"
-langchain-community>=0.2.0,<0.3.0 ; python_version < "3.13"
+# --- Database (SQLAlchemy + Postgres driver + migrations) ---
+SQLAlchemy>=2.0.29,<2.1.0
+alembic>=1.13.2,<1.14.0
+psycopg2-binary>=2.9.9,<3.0.0
 
-# --- LangChain core + split packages (Python 3.13+ compatible pins) ---
-langchain>=0.3.0,<0.4.0 ; python_version >= "3.13"
-langchain-core>=0.3.0,<0.4.0 ; python_version >= "3.13"
-langchain-openai>=0.2.0,<0.3.0 ; python_version >= "3.13"
-langchain-text-splitters>=0.3.0,<0.4.0 ; python_version >= "3.13"
-langchain-experimental>=0.3.0,<0.4.0 ; python_version >= "3.13"
-langchain-pinecone>=0.2.0,<0.3.0 ; python_version >= "3.13"
-langchain-community>=0.3.0,<0.4.0 ; python_version >= "3.13"
+# --- Authentication & request parsing ---
+bcrypt>=4.1.2,<5.0.0
+PyJWT>=2.8.0,<3.0.0
+python-multipart>=0.0.9,<0.1.0
 
-# --- Model providers / SDKs used by LangChain integrations ---
-openai>=1.30.0
+# --- LangChain + integrations (kept on 0.2.x line per LangChain docs) ---
+langchain>=0.2.16,<0.3.0
+langchain-core>=0.2.24,<0.3.0
+langchain-openai>=0.1.16,<0.2.0
+langchain-text-splitters>=0.2.1,<0.3.0
+langchain-community>=0.2.5,<0.3.0
+langchain-experimental>=0.0.63,<0.1.0
+langchain-pinecone>=0.1.0,<0.2.0
+langchainhub>=0.1.16,<0.2.0
+openai>=1.40.0,<2.0.0
 
-# --- Pinecone (vector DB SDK) ---
-# Note: Do NOT install pinecone-client or pinecone-plugin-inference separately
-# These are deprecated and will cause conflicts
-pinecone>=6.0.0,<8.0.0
+# --- Vector database client ---
+pinecone-client>=3.0.0,<4.0.0
 
-# --- YouTube transcripts ---
-youtube-transcript-api>=0.6.1
+# --- Retrieval helpers ---
+youtube-transcript-api>=1.2.3,<2.0.0
+langdetect>=1.0.9,<2.0.0
 
-# --- Gradio UI ---
-# gradio>=4.0.0
+# --- HTTP utilities ---
+requests>=2.32.0,<3.0.0
 
-# --- Authentication & security ---
-bcrypt>=4.0.0
-PyJWT>=2.8.0
-python-multipart>=0.0.7
-
-# --- Database migrations ---
-alembic>=1.13.0
-
-# --- Utilities ---
-python-dotenv>=1.0.0
-langdetect>=1.0.9
-duckduckgo-search>=4.0.0
-ddgs>=9.0.0
-
-# --- Version-specific overrides ---
-# Python <3.13 continues shipping with the legacy numpy line because wheels exist.
-numpy>=1.26.4,<2.0.0 ; python_version < "3.13"
-# Python 3.13+ requires numpy 2.x where wheels are published.
-numpy>=2.0.0 ; python_version >= "3.13"
+# --- Data validation ---
+pydantic>=2.7.0,<3.0.0

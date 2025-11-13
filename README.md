@@ -11,8 +11,8 @@
 ## ✨ Features
 
 ### **🤖 Intelligent AI Agent**
-- **Autonomous Tool Selection**: Agent decides when to use YouTube RAG vs web search
-- **Contextual Awareness**: Maintains conversation history across sessions
+- **Context-Aware Retrieval**: Agent orchestrates YouTube RAG and augments answers with Google Custom Search when necessary
+- **Conversation Memory**: Maintains conversation history across sessions
 - **Multi-Language Support**: Handles Hindi and English video transcripts
 
 ### **📚 World-Class RAG System**
@@ -181,8 +181,8 @@ GET /health
                     ┌────────────────┼────────────────┐
                     │                │                │
                ┌────▼─────┐    ┌────▼─────┐    ┌────▼──────┐
-               │ OpenAI   │    │ Pinecone │    │ DuckDuck  │
-               │(GPT-4o)  │    │ (Vector  │    │  Go       │
+               │ OpenAI   │    │ Pinecone │    │ Google    │
+               │(GPT-4o)  │    │ (Vector  │    │ Custom    │
                │          │    │  Store)  │    │  Search   │
                └──────────┘    └──────────┘    └───────────┘
 ```
@@ -193,7 +193,7 @@ GET /health
 2. **Session Management**: Retrieve or create user session
 3. **Video Processing**: Extract transcript, translate if needed
 4. **Embedding**: Store in user-specific Pinecone index
-5. **Agent Reasoning**: Decide between RAG or web search
+5. **Agent Reasoning**: Retrieve and synthesize context from the YouTube knowledge base and Google Custom Search
 6. **Response Generation**: GPT-4o-mini generates answer
 7. **Context Storage**: Save conversation in PostgreSQL
 
@@ -273,6 +273,7 @@ Optional:
 - **[NeonDB Setup](README_NEONDB.md)** - Cloud database configuration
 - **[Authentication Guide](AUTH_README.md)** - Auth system details
 - **[Quick Start](QUICK_START.md)** - Getting started guide
+- **[Search Tool Update](README_TOOL_CHANGE.md)** - Summary of the DuckDuckGo removal
 - **[API Documentation](http://localhost:8000/docs)** - Interactive Swagger UI
 
 ---
@@ -375,5 +376,6 @@ For questions or issues:
 
 **Built with ❤️ using FastAPI, LangChain, and NeonDB**
 
-#   a u g u s t u s - m a i n  
+#   a u g u s t u s - m a i n 
+ 
  
