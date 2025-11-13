@@ -359,9 +359,41 @@ try:
     base_prompt = hub_client.pull("hwchase17/react")
     # Enhance prompt with explicit tool format examples
     # PromptTemplate already imported at top of file
+    
+    # Handle different return types from hub_client.pull()
+    original_template = None
+    
     if isinstance(base_prompt, PromptTemplate):
-        # Extract the template and add format instructions
+        # Direct PromptTemplate object
         original_template = base_prompt.template
+    elif isinstance(base_prompt, str):
+        # Could be JSON string (serialized PromptTemplate) or plain string
+        try:
+            import json
+            # Try to parse as JSON (LangChain serialization format)
+            prompt_data = json.loads(base_prompt)
+            if isinstance(prompt_data, dict) and 'kwargs' in prompt_data and 'template' in prompt_data['kwargs']:
+                original_template = prompt_data['kwargs']['template']
+                print("[INFO] Extracted template from JSON serialized PromptTemplate")
+            else:
+                # Plain string - check if it has required variables
+                required_vars = ['{tools}', '{tool_names}', '{agent_scratchpad}']
+                if all(var in base_prompt for var in required_vars):
+                    original_template = base_prompt
+                    print("[INFO] Using base_prompt as plain string template")
+                else:
+                    raise ValueError("String template missing required variables")
+        except (json.JSONDecodeError, ValueError, KeyError):
+            # Not JSON or missing required variables - will use fallback
+            original_template = None
+            print(f"[WARN] Could not extract template from base_prompt string, will use fallback")
+    else:
+        # Unexpected type
+        print(f"[WARN] base_prompt is unexpected type: {type(base_prompt)}, will use fallback")
+        original_template = None
+    
+    if original_template:
+        # We have a valid template - enhance it
         enhanced_template = original_template + """
 
 CRITICAL: Tool calling format rules:
@@ -412,9 +444,76 @@ CRITICAL: Query Intent Analysis and Tool Selection:
 Always use the CORRECT format with Action and Action Input on separate lines.
 """
         REACT_AGENT_PROMPT = PromptTemplate.from_template(enhanced_template)
+        print("[OK] Agent prompt loaded from LangChain hub and enhanced with format instructions")
     else:
-        REACT_AGENT_PROMPT = base_prompt
-    print("[OK] Agent prompt loaded from LangChain hub and enhanced with format instructions")
+        # No valid template extracted - use fallback prompt
+        print("[WARN] Could not extract valid template from hub, using fallback prompt")
+        REACT_AGENT_PROMPT = PromptTemplate.from_template("""
+Answer the following questions as best you can. You have access to the following tools:
+
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+
+CRITICAL: Tool calling format rules:
+- Action and Action Input must be on SEPARATE lines
+- Do NOT use function call syntax like tool_name("input")
+- CORRECT format:
+  Action: youtube_rag_tool
+  Action Input: "what is asyncio?"
+- INCORRECT format (DO NOT USE):
+  Action: youtube_rag_tool("what is asyncio?")
+
+CRITICAL: Query Intent Analysis and Tool Selection:
+1. FIRST, analyze the query intent:
+   - Is this a time-sensitive question? (e.g., "latest", "recent", "updates", "new features", "current", "2024", "2025")
+   - Is this a general knowledge question about a topic? (e.g., "explain", "what is", "how does", "tell me about")
+
+2. Tool Selection Strategy:
+   - For GENERAL questions: Use youtube_rag_tool ONCE. Analyze the result. If it says "✅ FINAL ANSWER REQUIRED ✅", IMMEDIATELY synthesize the final answer. DO NOT call it again.
+   - For TIME-SENSITIVE questions: Use youtube_rag_tool FIRST. Analyze the result. If it says "🚨 NEXT ACTION REQUIRED 🚨" and "→ NEXT STEP: Call google_search_tool NOW", call google_search_tool next, then synthesize both sources.
+
+3. CRITICAL Tool Result Analysis (READ THE FIRST 3 LINES OF OBSERVATION):
+   - After EACH tool call, you MUST read the FIRST 3 lines of the Observation:
+     * If Observation contains "✅ FINAL ANSWER REQUIRED ✅" → IMMEDIATELY provide Final Answer (DO NOT call any more tools)
+     * If Observation contains "🚨 NEXT ACTION REQUIRED 🚨" → Read the "→ NEXT STEP:" line and follow it exactly:
+       - If it says "Call google_search_tool NOW" → Call google_search_tool immediately
+       - If it says "Provide Final Answer NOW" → Provide Final Answer immediately
+     * If Observation says "No relevant information found" → Use google_search_tool or provide final answer
+   - CRITICAL: After calling google_search_tool, you will receive "✅ FINAL ANSWER REQUIRED ✅" - this means you have BOTH video context AND web search results. IMMEDIATELY synthesize the final answer from both sources. DO NOT call youtube_rag_tool again.
+   - CRITICAL: Check your previous actions in the scratchpad - if you already called youtube_rag_tool, DO NOT call it again. If you already called google_search_tool, provide Final Answer.
+   - The Observation format is: [INSTRUCTION with emoji markers] followed by [context preview]
+   - READ THE FIRST 3 LINES FIRST - they tell you exactly what to do next
+   - DO NOT call the same tool twice with the same input
+   - DO NOT call youtube_rag_tool again after it returns context - follow the "→ NEXT STEP:" instruction
+
+4. Tool Call Limits:
+   - youtube_rag_tool: Maximum 1 call per query (analyze result and decide next step)
+   - google_search_tool: Maximum 1 call per query (only when needed based on youtube_rag_tool result or for time-sensitive queries)
+
+5. Tool Call History Tracking:
+   - Before calling ANY tool, check your previous actions in the scratchpad
+   - The scratchpad format is: Thought → Action → Action Input → Observation → Thought (repeat)
+   - If you see "Action: youtube_rag_tool" already executed → DO NOT call it again, check the Observation to see what to do next
+   - If you see "Action: google_search_tool" already executed → Provide Final Answer immediately (you have all information: video context + web search results)
+   - If you see both tools already called → You MUST provide Final Answer (no more tool calls needed)
+   - Use this history to avoid redundant tool calls and prevent looping
+
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}
+""")
+        print("[OK] Fallback prompt loaded")
 except Exception as e:
     print(f"[WARN] Could not load agent prompt from hub: {e}")
     print("   Using fallback prompt")
@@ -738,6 +837,7 @@ def signup(user_data: UserSignup, db: Session = Depends(get_db)):
 def signin(user_data: UserLogin, db: Session = Depends(get_db)):
     """Sign in user and return JWT token (legacy endpoint)"""
     # Check if user exists
+    print(f"[INFO] Signing in user: {user_data.username}")
     user = db.query(User).filter(User.username == user_data.username).first()
     if not user:
         raise HTTPException(
