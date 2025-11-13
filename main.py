@@ -32,12 +32,20 @@ from pathlib import Path
 #import gradio as gr
 from langdetect import detect
 from langchainhub import Client as HubClient
+# LangChain 0.2.x agent imports
+# Note: These are available in langchain>=0.2.16,<1.0.0
+# In LangChain 1.0.x, the API changed significantly
 try:
     from langchain.agents import create_react_agent, AgentExecutor
 except ImportError:
-    # Fallback for LangChain 0.2.x structure
-    from langchain.agents.react.agent import create_react_agent
-    from langchain.agents.executor import AgentExecutor
+    # If imports fail, it might be LangChain 1.0.x installed
+    # Pin to langchain<1.0.0 in requirements.txt
+    raise ImportError(
+        "Failed to import create_react_agent and AgentExecutor from langchain.agents.\n"
+        "This code requires langchain>=0.2.16,<1.0.0.\n"
+        "Please ensure requirements.txt specifies: langchain>=0.2.16,<1.0.0\n"
+        "Then reinstall: pip install -r requirements.txt --force-reinstall"
+    )
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
