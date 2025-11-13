@@ -31,8 +31,9 @@ import os,hashlib
 from pathlib import Path
 #import gradio as gr
 from langdetect import detect
-from langchain.agents import create_react_agent,AgentExecutor
 from langchain import hub
+from langchain.agents import AgentExecutor
+from langchain.agents.react import create_react_agent
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
