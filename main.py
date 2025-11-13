@@ -19,7 +19,7 @@ from youtube_transcript_api import (
 )
 from youtube_transcript_api.proxies import GenericProxyConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain.schema.runnable import RunnableLambda,RunnableParallel,RunnablePassthrough
+from langchain_core.runnables import RunnableLambda,RunnableParallel,RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone,ServerlessSpec
@@ -49,7 +49,7 @@ from typing import Optional, Dict, Any
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from database import get_db, User, UserSession, Message, SessionLocal
-from langchain.schema import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 try:
     import bcrypt
 except ImportError:
@@ -329,7 +329,7 @@ model = ChatOpenAI(model="gpt-4.1-mini")  # Uses OPENAI_API_KEY from environment
 try:
     base_prompt = hub.pull("hwchase17/react")
     # Enhance prompt with explicit tool format examples
-    from langchain.prompts import PromptTemplate
+    # PromptTemplate already imported at top of file
     if isinstance(base_prompt, PromptTemplate):
         # Extract the template and add format instructions
         original_template = base_prompt.template
@@ -390,7 +390,7 @@ except Exception as e:
     print(f"[WARN] Could not load agent prompt from hub: {e}")
     print("   Using fallback prompt")
     # Fallback prompt if hub is unavailable
-    from langchain.prompts import PromptTemplate
+    # PromptTemplate already imported at top of file
     REACT_AGENT_PROMPT = PromptTemplate.from_template("""
 Answer the following questions as best you can. You have access to the following tools:
 
