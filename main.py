@@ -85,13 +85,28 @@ app = FastAPI(
 )
 
 # CORS Configuration
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*").split(",")
+# Properly handle CORS for both development and production
+CORS_ORIGINS_STR = os.getenv("CORS_ORIGINS", "*").strip()
+if CORS_ORIGINS_STR == "*":
+    # Development mode - allow all origins
+    # Note: Cannot use allow_credentials=True with allow_origins=["*"]
+    # This is a browser security restriction
+    allow_origins = ["*"]
+    allow_credentials = False
+    print("[INFO] CORS: Allowing all origins (development mode)")
+else:
+    # Production mode - specific origins
+    allow_origins = [origin.strip() for origin in CORS_ORIGINS_STR.split(",") if origin.strip()]
+    allow_credentials = True
+    print(f"[INFO] CORS: Allowing origins: {', '.join(allow_origins)}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in CORS_ORIGINS],
-    allow_credentials=True,
+    allow_origins=allow_origins,
+    allow_credentials=allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],  # Expose all headers to frontend
 )
 
 # JWT Configuration
@@ -629,8 +644,13 @@ def get_user_index(username: str):
 @app.get("/health")
 def health_check(db: Session = Depends(get_db)):
     """Comprehensive health check endpoint"""
+    # Get CORS configuration for debugging
+    cors_origins = os.getenv("CORS_ORIGINS", "NOT SET (defaulting to *)")
+    
     health_status = {
         "status": "healthy",
+        "cors_configured": cors_origins != "NOT SET (defaulting to *)",
+        "cors_origins": cors_origins if cors_origins != "NOT SET (defaulting to *)" else "* (all origins allowed)",
         "environment": os.getenv("ENVIRONMENT", "development"),
         "timestamp": datetime.utcnow().isoformat(),
         "checks": {}
@@ -658,6 +678,21 @@ def health_check(db: Session = Depends(get_db)):
     health_status["checks"]["openai"] = "configured" if OPENAI_API_KEY else "not_configured"
     
     return health_status
+
+# CORS test endpoint (no authentication required)
+@app.get("/cors-test")
+def cors_test():
+    """Test endpoint to verify CORS configuration"""
+    cors_origins = os.getenv("CORS_ORIGINS", "NOT SET (defaulting to *)")
+    return {
+        "cors_configured": cors_origins != "NOT SET (defaulting to *)",
+        "cors_origins": cors_origins if cors_origins != "NOT SET (defaulting to *)" else "* (all origins allowed)",
+        "message": "If you can see this from your frontend, CORS is working correctly!",
+        "frontend_domains": [
+            "https://www.chataugustus.com",
+            "https://augustus-web-five.vercel.app"
+        ] if cors_origins != "NOT SET (defaulting to *)" else "All origins allowed"
+    }
 
 # User Registration and Authentication Endpoints
 @app.post("/signup", response_model=UserResponse)
