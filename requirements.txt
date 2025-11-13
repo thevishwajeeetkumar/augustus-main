@@ -17,15 +17,17 @@ PyJWT>=2.8.0
 python-multipart>=0.0.9
 
 # --- LangChain + integrations (compatible versions) ---
+# Pin to 0.2.x line to avoid conflicts with langchain-classic/langgraph-prebuilt (which require 1.0.x)
+# All packages pinned to <1.0.0 to ensure compatibility
 langchain>=0.2.16,<1.0.0
-langchain-core>=0.2.24
-langchain-openai>=0.1.16
-langchain-text-splitters>=0.2.1
-langchain-community>=0.2.5
-langchain-experimental>=0.0.63
-langchain-pinecone>=0.2.3
-langchainhub>=0.1.16
-openai>=1.40.0
+langchain-core>=0.2.24,<1.0.0
+langchain-openai>=0.1.16,<1.0.0
+langchain-text-splitters>=0.2.1,<1.0.0
+langchain-community>=0.2.5,<1.0.0
+langchain-experimental>=0.0.63,<1.0.0
+langchain-pinecone>=0.2.3,<1.0.0
+langchainhub>=0.1.16,<1.0.0
+openai>=1.40.0,<2.0.0
 
 # --- Vector database client ---
 pinecone-client>=3.0.0
