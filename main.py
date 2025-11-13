@@ -31,7 +31,7 @@ import os,hashlib
 from pathlib import Path
 #import gradio as gr
 from langdetect import detect
-from langchain import hub
+from langchainhub import Client as HubClient
 from langchain.agents import AgentExecutor
 from langchain.agents.react import create_react_agent
 from langchain_core.tools import tool
@@ -328,7 +328,8 @@ model = ChatOpenAI(model="gpt-4.1-mini")  # Uses OPENAI_API_KEY from environment
 
 # Load agent prompt once at startup (cache it)
 try:
-    base_prompt = hub.pull("hwchase17/react")
+    hub_client = HubClient()
+    base_prompt = hub_client.pull("hwchase17/react")
     # Enhance prompt with explicit tool format examples
     # PromptTemplate already imported at top of file
     if isinstance(base_prompt, PromptTemplate):
