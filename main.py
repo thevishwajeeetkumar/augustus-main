@@ -32,8 +32,12 @@ from pathlib import Path
 #import gradio as gr
 from langdetect import detect
 from langchainhub import Client as HubClient
-from langchain.agents import AgentExecutor
-from langchain.agents.react import create_react_agent
+try:
+    from langchain.agents import create_react_agent, AgentExecutor
+except ImportError:
+    # Fallback for LangChain 0.2.x structure
+    from langchain.agents.react.agent import create_react_agent
+    from langchain.agents.executor import AgentExecutor
 from langchain_core.tools import tool
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.outputs import LLMResult
