@@ -52,6 +52,8 @@ from langchain_core.outputs import LLMResult
 
 from requests import Session as RequestsSession
 import requests
+from requests.cookies import RequestsCookieJar
+from http.cookies import SimpleCookie
 
 from fastapi import FastAPI, Path, HTTPException, Query, Depends, status
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -334,9 +336,18 @@ if YOUTUBE_PROXY_URL:
             http_url=YOUTUBE_PROXY_URL,
             https_url=YOUTUBE_PROXY_URL,
         )
-        print(f"[INFO] Using YouTube proxy endpoint: {YOUTUBE_PROXY_URL}")
+        # Mask password if present in URL
+        safe_url = YOUTUBE_PROXY_URL.split('@')[-1] if '@' in YOUTUBE_PROXY_URL else YOUTUBE_PROXY_URL
+        print(f"[INFO] Using YouTube proxy endpoint: {safe_url}")
     except Exception as e:
-        print(f"[WARN] Could not configure YouTube proxy '{YOUTUBE_PROXY_URL}': {e}")
+        # In production, if proxy is required, fail fast
+        safe_url = YOUTUBE_PROXY_URL.split('@')[-1] if '@' in YOUTUBE_PROXY_URL else YOUTUBE_PROXY_URL
+        if os.getenv("ENVIRONMENT", "development") == "production":
+            raise ValueError(
+                f"Failed to configure required YouTube proxy: {e}. "
+                "Set YOUTUBE_PROXY_URL correctly or disable proxy requirement."
+            )
+        print(f"[WARN] Could not configure YouTube proxy '{safe_url}': {e}")
         YOUTUBE_PROXIES = None
 
 YOUTUBE_COOKIES = None
@@ -350,6 +361,23 @@ if YOUTUBE_COOKIES_FILE:
 if not YOUTUBE_COOKIES and YOUTUBE_COOKIES_HEADER:
     YOUTUBE_COOKIES = YOUTUBE_COOKIES_HEADER
     print("[INFO] Using YouTube cookies provided via environment header")
+
+def parse_cookie_string(cookie_str: str) -> RequestsCookieJar:
+    """Parse cookie string into RequestsCookieJar for robust cookie handling"""
+    jar = RequestsCookieJar()
+    cookies = SimpleCookie()
+    cookies.load(cookie_str)
+    for key, morsel in cookies.items():
+        jar.set(key, morsel.value, domain='.youtube.com')
+    return jar
+
+# Global HTTP client for connection pooling
+GLOBAL_HTTP_CLIENT = None
+if YOUTUBE_COOKIES:
+    GLOBAL_HTTP_CLIENT = RequestsSession()
+    # Use cookie jar for robust cookie handling
+    cookie_jar = parse_cookie_string(YOUTUBE_COOKIES)
+    GLOBAL_HTTP_CLIENT.cookies.update(cookie_jar)
 
 model = ChatOpenAI(model="gpt-4.1-mini")  # Uses OPENAI_API_KEY from environment
 
@@ -618,12 +646,15 @@ def fetchTranscript(url:str)->list:
     video_id=get_youtube_video_id(url)
 
     try:
-        http_client = None
-        if YOUTUBE_COOKIES:
+        # Reuse global client if available, otherwise create new one
+        http_client = GLOBAL_HTTP_CLIENT
+        if not http_client and YOUTUBE_COOKIES:
+            # Fallback: create new client if global doesn't exist and cookies are needed
             # youtube-transcript-api removed the cookies_config parameter; instead we
-            # attach the raw cookie header to a custom requests.Session.
+            # attach cookies via a custom requests.Session.
             http_client = RequestsSession()
-            http_client.headers.update({"Cookie": YOUTUBE_COOKIES})
+            cookie_jar = parse_cookie_string(YOUTUBE_COOKIES)
+            http_client.cookies.update(cookie_jar)
 
         client = YouTubeTranscriptApi(
             proxy_config=YOUTUBE_PROXIES,
