@@ -25,12 +25,11 @@ langchain-openai>=0.1.16,<1.0.0
 langchain-text-splitters>=0.2.1,<1.0.0
 langchain-community>=0.2.5,<1.0.0
 langchain-experimental>=0.0.63,<1.0.0
-langchain-pinecone>=0.2.3,<1.0.0
 langchainhub>=0.1.16,<1.0.0
 openai>=1.40.0,<2.0.0
 
 # --- Vector database client ---
-pinecone-client>=3.0.0
+pinecone>=5.0.0
 
 # --- Retrieval helpers ---
 youtube-transcript-api>=1.2.3

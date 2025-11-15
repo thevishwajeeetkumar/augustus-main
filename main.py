@@ -21,8 +21,7 @@ from youtube_transcript_api.proxies import GenericProxyConfig
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.runnables import RunnableLambda,RunnableParallel,RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
-from langchain_pinecone import PineconeVectorStore
-from pinecone import Pinecone,ServerlessSpec
+from pinecone import Pinecone
 from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
 from pydantic import BaseModel,HttpUrl
@@ -614,12 +613,14 @@ Thought:{agent_scratchpad}
 """)
 
 #Pinecone Database setting-----------------------------------------------------------------------------
-# Initialize Pinecone client only (indexes created per-user dynamically)
+# Initialize Pinecone client - using shared index with namespaces
+SHARED_INDEX_NAME = "augustus-videos-integrated"
+
 if PINECONE_API_KEY:
     try:
         pc = Pinecone(api_key=PINECONE_API_KEY)
         print("[OK] Pinecone client initialized successfully")
-        print("   Indexes will be created per-user on first request")
+        print(f"   Using shared index: {SHARED_INDEX_NAME}")
     except Exception as e:
         print(f"[WARN] Pinecone initialization failed: {e}")
         print("   Pinecone features will not be available.")
@@ -628,12 +629,21 @@ else:
     print("[WARN] Pinecone not configured (PINECONE_API_KEY not set)")
     pc = None
 
+# Retrieval Quality Configuration
+ENABLE_SCORE_THRESHOLDING = True   # Set to False to disable score filtering (useful for debugging score distributions)
+MIN_SIMILARITY_SCORE = 0.0         # Minimum reranking score to include (start with 0.0, tune based on actual score distributions)
+MAX_CHUNKS_PER_VIDEO = 10           # Maximum chunks from same video (ensures diversity)
+MAX_CONTEXT_LENGTH = 40000          # Maximum characters in context (prevents LLM overflow)
+BASE_TOP_K = 12                    # Base number of results for youtube_rag_tool (already used: 12*2 = 24 candidates)
+FALLBACK_TOP_K = 10                # Base number of results for fallback RAG (already used: 10*2 = 20 candidates)
+
 parser = StrOutputParser()
 
 
 
 #Embedding generation-----------------------
-embedding=OpenAIEmbeddings(model='text-embedding-3-large')
+# NOTE: OpenAI embeddings removed - using Pinecone integrated embeddings instead
+# embedding=OpenAIEmbeddings(model='text-embedding-3-large')  # No longer needed
 
 # Note: Tools and agent are created per-request inside the endpoint
 # This ensures proper context isolation and prevents race conditions
@@ -709,25 +719,154 @@ prompt=PromptTemplate(
 )
 
 
-def format_docs(retrieved_docs):
+def format_docs(retrieved_docs, max_length=None):
+    """
+    Format retrieved documents into context string.
+    
+    Args:
+        retrieved_docs: List of Document objects
+        max_length: Maximum context length in characters (optional, defensive check)
+    
+    Returns:
+        Formatted context string
+    """
+    if not retrieved_docs:
+        return ""
+    
     context_text = "\n\n".join(doc.page_content for doc in retrieved_docs)
+    
+    # Defensive check: truncate if somehow exceeds limit
+    if max_length and len(context_text) > max_length:
+        print(f"[WARN] Context exceeded limit ({len(context_text)} > {max_length}), truncating")
+        context_text = context_text[:max_length] + "..."
+    
     return context_text
 
 
-# Helper function to get or create user-specific Pinecone index
-def get_user_index(username: str):
+def process_retrieval_results(docs, min_score=None, max_per_video=None, max_context_length=None):
     """
-    Get or create a Pinecone index for the specific user.
-    Each user gets their own isolated index for embeddings.
+    Post-process retrieval results with score thresholding, diversity, and context management.
     
     Args:
-        username: The username to create/get index for
-        
+        docs: List of Document objects from retrieval
+        min_score: Minimum similarity score threshold (default: MIN_SIMILARITY_SCORE)
+        max_per_video: Maximum chunks per video (default: MAX_CHUNKS_PER_VIDEO)
+        max_context_length: Maximum context length in characters (default: MAX_CONTEXT_LENGTH)
+    
     Returns:
-        Pinecone Index object for the user
+        List of Document objects after filtering and limiting
+    """
+    if not docs:
+        return []
+    
+    # Use defaults if not provided
+    min_score = min_score if min_score is not None else MIN_SIMILARITY_SCORE
+    max_per_video = max_per_video if max_per_video is not None else MAX_CHUNKS_PER_VIDEO
+    max_context_length = max_context_length if max_context_length is not None else MAX_CONTEXT_LENGTH
+    
+    # Step 1: Filter by score threshold
+    # CRITICAL: Add defensive error handling for score access
+    # LOG ACTUAL SCORES BEFORE FILTERING (for debugging score distributions)
+    if docs:
+        raw_scores = []
+        for doc in docs:
+            score = doc.metadata.get('_score', 0.0)
+            if isinstance(score, (int, float)):
+                raw_scores.append(score)
+        
+        if raw_scores:
+            print(f"[RETRIEVAL] Raw scores before filtering: count={len(raw_scores)}, min={min(raw_scores):.3f}, max={max(raw_scores):.3f}, mean={sum(raw_scores)/len(raw_scores):.3f}, median={sorted(raw_scores)[len(raw_scores)//2]:.3f}")
+        else:
+            print(f"[RETRIEVAL] Warning: No valid scores found in {len(docs)} documents")
+    
+    # Apply score thresholding only if enabled
+    if ENABLE_SCORE_THRESHOLDING:
+        filtered_docs = []
+        for doc in docs:
+            score = doc.metadata.get('_score', 0.0)
+            # Defensive check: validate score type (AGENTS.md line 696: scores are floats)
+            if not isinstance(score, (int, float)):
+                score = 0.0  # Default if invalid type
+            if score >= min_score:
+                filtered_docs.append(doc)
+        
+        # If all results filtered, log warning and check if we should use fallback
+        if not filtered_docs:
+            print(f"[WARN] All {len(docs)} results filtered out by score threshold ({min_score})")
+            # Fallback: if threshold is too aggressive, use top results anyway (prevents complete failure)
+            # This ensures we always have some context even if scores are low
+            if docs and min_score > 0:
+                # Sort by score and take top results as fallback
+                sorted_fallback = sorted(docs, key=lambda x: x.metadata.get('_score', 0), reverse=True)
+                fallback_count = min(3, len(sorted_fallback))  # Take top 3 as fallback
+                filtered_docs = sorted_fallback[:fallback_count]
+                print(f"[RETRIEVAL] Fallback: Using top {fallback_count} results despite low scores")
+                if fallback_count > 0:
+                    fallback_scores = [d.metadata.get('_score', 0) for d in filtered_docs]
+                    print(f"[RETRIEVAL] Fallback scores: {[f'{s:.3f}' for s in fallback_scores]}")
+            else:
+                return []  # No fallback possible
+    else:
+        # Score thresholding disabled - use all results
+        filtered_docs = docs
+        print(f"[RETRIEVAL] Score thresholding disabled, using all {len(docs)} results")
+    
+    # Step 2: Apply diversity (limit chunks per video)
+    # Sort by score first (highest first) - maintains reranking quality
+    sorted_docs = sorted(filtered_docs, key=lambda x: x.metadata.get('_score', 0), reverse=True)
+    
+    diverse_docs = []
+    video_count = {}
+    for doc in sorted_docs:
+        vid_id = doc.metadata.get('video_id')
+        if vid_id:
+            count = video_count.get(vid_id, 0)
+            if count < max_per_video:
+                diverse_docs.append(doc)
+                video_count[vid_id] = count + 1
+        else:
+            # Include if no video_id (shouldn't happen, but safe)
+            diverse_docs.append(doc)
+    
+    # Step 3: Limit context length
+    total_length = 0
+    final_docs = []
+    for doc in diverse_docs:
+        doc_length = len(doc.page_content)
+        if total_length + doc_length <= max_context_length:
+            final_docs.append(doc)
+            total_length += doc_length
+        else:
+            # Truncate last doc if there's meaningful space remaining
+            remaining = max_context_length - total_length
+            if remaining > 100:  # Only if meaningful content remains (at least 100 chars)
+                truncated_doc = Document(
+                    page_content=doc.page_content[:remaining] + "...",
+                    metadata=doc.metadata
+                )
+                final_docs.append(truncated_doc)
+            break
+    
+    # Log processing stats
+    print(f"[RETRIEVAL] Processed {len(docs)} -> {len(filtered_docs)} (score) -> {len(diverse_docs)} (diversity) -> {len(final_docs)} (context) results")
+    if final_docs:
+        scores = [d.metadata.get('_score', 0) for d in final_docs]
+        print(f"[RETRIEVAL] Final score range: {min(scores):.3f} - {max(scores):.3f}, total context: {total_length} chars")
+    
+    return final_docs
+
+
+# Helper function to get shared Pinecone index
+def get_shared_index():
+    """
+    Get the shared Pinecone index for all users.
+    Data isolation is achieved through namespaces.
+    
+    Returns:
+        Pinecone Index object for the shared index
         
     Raises:
-        HTTPException: If Pinecone is not available
+        HTTPException: If Pinecone is not available or index doesn't exist
     """
     if pc is None:
         raise HTTPException(
@@ -735,39 +874,145 @@ def get_user_index(username: str):
             detail="Pinecone service is not available. Please configure PINECONE_API_KEY in .env file."
         )
     
-    # Sanitize username for Pinecone index naming rules
-    # Rules: lowercase, alphanumeric, hyphens only, max 45 chars
-    index_name = username.lower()
-    index_name = index_name.replace("_", "-").replace(" ", "-")
-    # Remove any other special characters
-    index_name = ''.join(c for c in index_name if c.isalnum() or c == '-')
-    # Ensure it doesn't start/end with hyphen
-    index_name = index_name.strip('-')
-    # Limit length
-    index_name = index_name[:45]
+    if not pc.has_index(SHARED_INDEX_NAME):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Shared index '{SHARED_INDEX_NAME}' not found. Run: pc index create -n {SHARED_INDEX_NAME} -m cosine -c aws -r us-east-1 --model llama-text-embed-v2 --field_map text=content"
+        )
     
-    # Check if user's index already exists
-    existing_indexes = [idx.name for idx in pc.list_indexes()]
+    return pc.Index(SHARED_INDEX_NAME)
+
+
+# Helper function to generate namespace for user
+def get_user_namespace(username: str) -> str:
+    """
+    Generate namespace for user: user_{username}
+    Ensures data isolation per user within the shared index.
     
-    if index_name not in existing_indexes:
-        print(f"[INFO] Creating new Pinecone index for user: {username}")
-        print(f"   Index name: {index_name}")
+    Args:
+        username: The username to generate namespace for
         
-        # Create new index for this user
-        pc.create_index(
-            name=index_name,
-            dimension=3072,  # Must match OpenAI embeddings dimension
-            metric="cosine",
-            spec=ServerlessSpec(cloud='aws', region='us-east-1')
+    Returns:
+        Namespace string in format: user_{sanitized_username}
+    """
+    # Sanitize username for namespace (similar to old index name logic)
+    sanitized = username.lower().replace("_", "-").replace(" ", "-")
+    sanitized = ''.join(c for c in sanitized if c.isalnum() or c == '-')
+    sanitized = sanitized.strip('-')
+    return f"user_{sanitized}"
+
+
+def check_video_exists_in_pinecone(index, namespace: str, video_id: str) -> bool:
+    """
+    Check if any records exist for a given video_id in namespace.
+    
+    Uses search with metadata filter to check existence efficiently.
+    This approach works reliably with the current Pinecone SDK (index.list() 
+    returns a generator, not an object with .records attribute).
+    
+    Args:
+        index: Pinecone Index object (from get_shared_index())
+        namespace: Namespace string (from get_user_namespace())
+        video_id: YouTube video ID to check
+        
+    Returns:
+        True if any records with video_id exist, False otherwise
+        
+    Note:
+        Uses index.search() with filter (AGENTS.md lines 825-841).
+        Matches existing pattern used at line 1455.
+        Returns False on any error (conservative: assumes not found, will fetch transcript).
+    """
+    try:
+        # Use search with metadata filter for existence check
+        # AGENTS.md line 825-841: Dynamic filter pattern
+        # Matches existing pattern at line 1455: {"video_id": video_id}
+        query_dict = {
+            "top_k": 1,  # Only need to check existence (minimal overhead)
+            "inputs": {
+                "text": "video"  # Generic query text for embeddings (needs valid text, not "dummy")
+            },
+            "filter": {"video_id": video_id}  # Filter by video_id (shorthand format, matches line 1455)
+        }
+        
+        # Search without reranking (unnecessary overhead for existence check)
+        # AGENTS.md line 662-674 says "always rerank" but that's for quality, not existence checks
+        result = exponential_backoff_retry(
+            lambda: index.search(
+                namespace=namespace,
+                query=query_dict
+                # No rerank parameter - we only need existence check
+            )
         )
         
-        print(f"[OK] Index '{index_name}' created successfully")
-        print(f"   Note: First request may take ~60 seconds while index initializes")
-    else:
-        print(f"[INFO] Using existing Pinecone index: {index_name}")
+        # Access results via dict-style (matches existing pattern at line 1481, 2034)
+        # AGENTS.md line 221: reranked_results['result']['hits']
+        # Even without reranking, results have same structure: result['result']['hits']
+        return len(result['result']['hits']) > 0
+    except Exception as e:
+        print(f"[WARN] Error checking video existence for {video_id}: {e}")
+        # Conservative: assume not found, will fetch transcript (graceful degradation)
+        return False
+
+
+# Utility functions for Pinecone operations
+def exponential_backoff_retry(func, max_retries=5):
+    """
+    Retry with exponential backoff for transient errors.
     
-    # Return the index handle
-    return pc.Index(index_name)
+    Args:
+        func: Function to retry (lambda or callable)
+        max_retries: Maximum number of retry attempts
+        
+    Returns:
+        Result of func() if successful
+        
+    Raises:
+        Exception: If all retries fail or non-retryable error occurs
+    """
+    from pinecone.exceptions import PineconeException
+    import time
+    
+    for attempt in range(max_retries):
+        try:
+            return func()
+        except PineconeException as e:
+            status_code = getattr(e, 'status', None)
+            if status_code and (status_code >= 500 or status_code == 429):
+                if attempt < max_retries - 1:
+                    delay = min(2 ** attempt, 60)  # Exponential backoff, cap at 60s
+                    time.sleep(delay)
+                else:
+                    raise
+            else:
+                raise  # Don't retry client errors (4xx except 429)
+
+
+def batch_upsert_records(index, namespace, records, batch_size=96):
+    """
+    Upsert records in batches with retry logic (for integrated embeddings).
+    Pinecone automatically generates embeddings from the 'content' field.
+    
+    CRITICAL CONSTRAINTS (AGENTS.md line 641-647, 693):
+    - Text records: MAX 96 per batch, 2MB total per batch
+    - Always use namespaces (AGENTS.md line 656-657)
+    - Use exponential_backoff_retry for transient errors (AGENTS.md line 715-733)
+    
+    Args:
+        index: Pinecone Index object
+        namespace: Namespace string (REQUIRED - AGENTS.md line 656-657)
+        records: List of record dictionaries with '_id', 'content', and metadata
+        batch_size: Number of records per batch (max 96 for text records - AGENTS.md line 693)
+    """
+    import time
+    
+    for i in range(0, len(records), batch_size):
+        batch = records[i:i + batch_size]
+        # CRITICAL: Method signature is index.upsert_records(namespace, records) - AGENTS.md line 416
+        exponential_backoff_retry(
+            lambda: index.upsert_records(namespace, batch)
+        )
+        time.sleep(0.1)  # Rate limiting
 
 
 # Health check endpoint (no authentication required)
@@ -797,8 +1042,10 @@ def health_check(db: Session = Depends(get_db)):
     # Pinecone check
     if pc is not None:
         try:
-            pc.list_indexes()
-            health_status["checks"]["pinecone"] = "ok"
+            if pc.has_index(SHARED_INDEX_NAME):
+                health_status["checks"]["pinecone"] = "ok"
+            else:
+                health_status["checks"]["pinecone"] = f"index '{SHARED_INDEX_NAME}' not found"
         except Exception as e:
             health_status["checks"]["pinecone"] = f"error: {str(e)}"
     else:
@@ -1060,46 +1307,81 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
     
     if url:
         try:
-            pine_index = get_user_index(user.username)
+            # Extract video_id from URL first (no API call needed)
+            video_id = get_youtube_video_id(url)
+            if not video_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Invalid YouTube URL. Could not extract video ID."
+                )
             
-            # Fetch transcript
-            l = fetchTranscript(url)
-            transcript = l[0]
-            video_id = l[1]
             current_video_id = video_id
             
-            # Embed in Pinecone
-            parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1600, chunk_overlap=200)
-            chunks = parent_splitter.create_documents([transcript])
+            # Get shared index and namespace
+            index = get_shared_index()
+            namespace = get_user_namespace(user.username)
             
-            for i, d in enumerate(chunks):
-                d.metadata = {"video_id": video_id, "doc_id": f"{video_id}:p{i}"}
-            
-            store = PineconeVectorStore(index=pine_index, embedding=embedding)
-            ids = [f"{video_id}:{hashlib.sha1(d.page_content.encode('utf-8')).hexdigest()[:16]}" for d in chunks]
-            
-            # Check if already embedded
-            already = False
-            if ids:
-                probe_ids = ids[:8]
-                try:
-                    existing = pine_index.fetch(ids=probe_ids)
-                    vectors = existing.get("vectors", {}) if isinstance(existing, dict) else getattr(existing, "vectors", {}) or {}
-                    already = len(vectors) > 0
-                except Exception:
-                    already = False
-            
-            if not already:
-                store.add_documents(documents=chunks, ids=ids)
-                print(f"[OK] Embedded video {video_id} for user {user.username}")
+            # Check if video already embedded in Pinecone (before fetching transcript)
+            if check_video_exists_in_pinecone(index, namespace, video_id):
+                print(f"[INFO] Video {video_id} already embedded, skipping transcript fetch")
+                # Update session with current video and continue to Q&A
+                session.current_video_id = video_id
+                session.current_video_url = url
+                session.last_activity = datetime.utcnow()
+                db.commit()
             else:
-                print(f"[INFO] Video {video_id} already embedded")
-            
-            # Update session with current video
-            session.current_video_id = video_id
-            session.current_video_url = url
-            session.last_activity = datetime.utcnow()
-            db.commit()
+                # Video not found in Pinecone - fetch transcript and embed
+                print(f"[INFO] Video {video_id} not found in Pinecone, fetching transcript")
+                
+                # Fetch transcript
+                l = fetchTranscript(url)
+                transcript = l[0]
+                # video_id already extracted above, no need to get from l[1]
+                
+                # Embed in Pinecone
+                parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
+                chunks = parent_splitter.create_documents([transcript])
+                
+                # Prepare records (text only - Pinecone embeds automatically)
+                # Format matches AGENTS.md line 404-411
+                records = []
+                for i, chunk in enumerate(chunks):
+                    vector_id = f"{video_id}:{hashlib.sha1(chunk.page_content.encode('utf-8')).hexdigest()[:16]}"
+                    records.append({
+                        "_id": vector_id,
+                        "content": chunk.page_content,  # CRITICAL: Must match field_map (text=content)
+                        "video_id": video_id,            # Metadata (flat structure - AGENTS.md line 630-635)
+                        "doc_id": f"{video_id}:p{i}"     # Metadata (flat structure)
+                    })
+                    # Note: No nested objects allowed (AGENTS.md line 619-636)
+                    # All metadata must be flat: strings, ints, floats, bools, string lists only
+                
+                # Defensive check: verify records don't already exist (should rarely trigger since we checked above)
+                # This handles potential race conditions or check failures
+                already = False
+                if records:
+                    probe_ids = [r["_id"] for r in records[:8]]
+                    try:
+                        result = index.fetch(namespace=namespace, ids=probe_ids)
+                        # CRITICAL: Use result.records (not result.vectors) for integrated embeddings
+                        # AGENTS.md line 449: if result.records:
+                        already = len(result.records) > 0
+                    except Exception:
+                        already = False
+                
+                # Batch upsert with retry
+                # AGENTS.md line 416: index.upsert_records(namespace, records)
+                if not already:
+                    batch_upsert_records(index, namespace, records, batch_size=96)  # Max 96 per batch
+                    print(f"[OK] Embedded video {video_id} for user {user.username}")
+                else:
+                    print(f"[INFO] Video {video_id} already embedded (defensive check triggered)")
+                
+                # Update session with current video
+                session.current_video_id = video_id
+                session.current_video_url = url
+                session.last_activity = datetime.utcnow()
+                db.commit()
             
         except HTTPException:
             raise
@@ -1169,32 +1451,72 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
             if not sess:
                 return "OBSERVATION: Session not found. Cannot retrieve video information."
             
-            # Get user's Pinecone index
-            pine_index = get_user_index(username_str)
-            store = PineconeVectorStore(index=pine_index, embedding=embedding)
+            # Get shared index and namespace
+            index = get_shared_index()
+            namespace = get_user_namespace(username_str)
             
-            # Determine search strategy:
-            # 1. If current_video_id exists in session, filter by it (current session video)
-            # 2. If no current_video_id, search across all user's videos (previous sessions)
-            search_kwargs = {
-                'k': 12,  # Retrieve more chunks for better coverage
+            # Build query with text input (Pinecone embeds automatically)
+            # AGENTS.md line 510-515: query structure for integrated embeddings
+            query_dict = {
+                "top_k": 12 * 2,  # More candidates for reranking (AGENTS.md line 511)
+                "inputs": {
+                    "text": question  # Text input (must match field_map: text=content)
+                }
             }
             
+            # Add filter if current_video_id exists
+            # AGENTS.md line 825-841: Dynamic filter pattern - only add if exists
             if sess.current_video_id:
-                # Filter by current session's video
-                search_kwargs['filter'] = {"video_id": sess.current_video_id}
+                query_dict["filter"] = {"video_id": sess.current_video_id}
                 print(f"[youtube_rag_tool] Searching with video_id filter: {sess.current_video_id}")
             else:
-                # No current video in session, but search across all user's videos
-                # (videos may have been processed in previous sessions)
-                print(f"[youtube_rag_tool] No current_video_id in session, searching across all user videos")
+                # CRITICAL: Don't set filter to None - omit the key entirely (AGENTS.md line 826)
+                print(f"[youtube_rag_tool] No current_video_id, searching across all user videos")
             
-            # Create retriever
-            retriever = store.as_retriever(search_kwargs=search_kwargs)
-            
-            # Retrieve relevant documents based on the question
-            # Use invoke() instead of get_relevant_documents() to avoid deprecation warning
-            docs = retriever.invoke(question)
+            # Search with reranking (AGENTS.md line 213-217, 516-520)
+            # AGENTS.md line 662-674: "always rerank in production"
+            try:
+                results = exponential_backoff_retry(
+                    lambda: index.search(
+                        namespace=namespace,
+                        query=query_dict,
+                        rerank={
+                            "model": "bge-reranker-v2-m3",  # AGENTS.md line 517, 214
+                            "top_n": 12,                    # Final number after reranking
+                            "rank_fields": ["content"]       # Field to rerank on (AGENTS.md line 519, 216)
+                        }
+                    )
+                )
+                
+                # Convert results to LangChain Document format
+                # CRITICAL: With reranking, use dict-style access (AGENTS.md line 221-230)
+                # AGENTS.md line 221: reranked_results['result']['hits']
+                # AGENTS.md line 225: "IMPORTANT: With reranking, use dict-style access"
+                raw_docs = []
+                for hit in results['result']['hits']:  # Dict access pattern
+                    doc = Document(
+                        page_content=hit['fields']['content'],  # Dict access (AGENTS.md line 222, 229)
+                        metadata={
+                            'video_id': hit['fields'].get('video_id'),  # Use .get() for optional (AGENTS.md line 230)
+                            'doc_id': hit['fields'].get('doc_id'),
+                            '_id': hit['_id'],              # Dict access (AGENTS.md line 227)
+                            '_score': hit['_score']         # Dict access (AGENTS.md line 228)
+                        }
+                    )
+                    raw_docs.append(doc)
+                
+                # Apply post-processing: score thresholding, diversity, context management
+                docs = process_retrieval_results(
+                    raw_docs,
+                    min_score=MIN_SIMILARITY_SCORE,
+                    max_per_video=MAX_CHUNKS_PER_VIDEO,
+                    max_context_length=MAX_CONTEXT_LENGTH
+                )
+            except Exception as e:
+                print(f"[ERROR] Search failed: {e}")
+                import traceback
+                traceback.print_exc()
+                docs = []
             
             if not docs:
                 if sess.current_video_id:
@@ -1204,7 +1526,7 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
             
             # Format and return raw context (NOT a pre-generated answer)
             # The agent will synthesize this context into a final answer
-            context = format_docs(docs)
+            context = format_docs(docs, max_length=MAX_CONTEXT_LENGTH)
             
             # Add context about which video(s) the information came from
             video_ids_found = set()
@@ -1219,9 +1541,8 @@ def answer_from_video(user_input: input, current_user: dict = Depends(require_sc
             is_time_sensitive_query = any(keyword in question.lower() for keyword in time_sensitive_keywords)
             
             # Structure response with CRITICAL INSTRUCTION FIRST, then context
-            # Truncate context to prevent it from overwhelming the instruction
-            # Limit context to first 500 chars to ensure instruction is always visible
-            context_preview = context[:500] + "..." if len(context) > 500 else context
+            # Use full context - no truncation (MAX_CONTEXT_LENGTH already limits retrieval)
+            context_preview = context
             
             if video_ids_found:
                 if len(video_ids_found) == 1:
@@ -1460,7 +1781,7 @@ DO NOT call any more tools - you have all the information needed.
         agent=agent,
         tools=tools_list,
         handle_parsing_errors=parsing_error_handler,
-        verbose=False,  # Disable verbose to avoid callback errors
+        verbose=True,  # Disable verbose to avoid callback errors
         max_iterations=5,  # Allow: 1 for youtube_rag, 1 for google_search (if needed), 1 for final answer + buffer for looping
         return_intermediate_steps=True,  # Enable to detect tool failures
         callbacks=[tool_tracking_callback]  # Track tool calls
@@ -1748,17 +2069,54 @@ DO NOT call any more tools - you have all the information needed.
         if should_fallback and (current_vid or session.current_video_id):
             try:
                 print(f"[FALLBACK] Agent failed ({failure_reason}), using direct RAG for query: {query}")
-                pine_index = get_user_index(user.username)
-                store = PineconeVectorStore(index=pine_index, embedding=embedding)
-                retriever = store.as_retriever(
-                    search_kwargs={
-                        'k': 10,
-                        'filter': {"video_id": current_vid or session.current_video_id}
-                    }
+                index = get_shared_index()
+                namespace = get_user_namespace(user.username)
+                
+                # Build query dict (AGENTS.md line 855-862: Dynamic filter pattern)
+                query_dict = {
+                    "top_k": 10 * 2,  # More candidates for reranking (AGENTS.md line 511)
+                    "inputs": {"text": query}  # Text input (AGENTS.md line 512-513)
+                }
+                
+                # Only add filter if it exists (AGENTS.md line 859-860)
+                if current_vid or session.current_video_id:
+                    query_dict["filter"] = {"video_id": current_vid or session.current_video_id}
+                # Don't set filter to None - omit key entirely if no filter
+                
+                # Search with reranking (AGENTS.md line 508-522)
+                results = exponential_backoff_retry(
+                    lambda: index.search(
+                        namespace=namespace,
+                        query=query_dict,
+                        rerank={
+                            "model": "bge-reranker-v2-m3",  # AGENTS.md line 517
+                            "top_n": 10,                    # Final results after reranking
+                            "rank_fields": ["content"]      # AGENTS.md line 519
+                        }
+                    )
                 )
-                docs = retriever.invoke(query)
+                
+                # Parse results with dict-style access (AGENTS.md line 221-230)
+                raw_docs = [Document(
+                    page_content=hit['fields']['content'],  # Dict access (AGENTS.md line 222)
+                    metadata={
+                        'video_id': hit['fields'].get('video_id'),  # Use .get() for optional (AGENTS.md line 230)
+                        'doc_id': hit['fields'].get('doc_id'),
+                        '_id': hit['_id'],
+                        '_score': hit['_score']
+                    })
+                    for hit in results['result']['hits']]  # Dict access (AGENTS.md line 221)
+                
+                # Apply post-processing: score thresholding, diversity, context management
+                docs = process_retrieval_results(
+                    raw_docs,
+                    min_score=MIN_SIMILARITY_SCORE,
+                    max_per_video=MAX_CHUNKS_PER_VIDEO,
+                    max_context_length=MAX_CONTEXT_LENGTH
+                )
+                
                 if docs:
-                    context = format_docs(docs)
+                    context = format_docs(docs, max_length=MAX_CONTEXT_LENGTH)
                     # Build fallback chain
                     fallback_chain = RunnableParallel({
                         'question': RunnablePassthrough(),
