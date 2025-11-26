@@ -26,7 +26,7 @@ from langchain_core.prompts import PromptTemplate
 from langchain_core.documents import Document
 from pydantic import BaseModel,HttpUrl
 from yt_to_id import get_youtube_video_id
-import os,hashlib
+import hashlib
 from pathlib import Path
 #import gradio as gr
 from langdetect import detect
@@ -59,10 +59,24 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
 import secrets
 import base64
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple, List, Callable
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from database import get_db, User, UserSession, Message, SessionLocal
+from database import (
+    get_db, User, SessionLocal,
+    VideoConversation, ConversationMessage, VideosCatalog  # Schema 2 models
+)
+from schema2_crud import (
+    get_or_create_conversation,
+    get_conversation_by_id,
+    insert_conversation_turn,
+    get_recent_messages_for_context,
+    get_or_create_catalog_entry,
+    get_conversation_messages,
+    serialize_message_for_api,
+    verify_conversation_ownership,
+    get_user_conversation_ids,
+)
 from langchain_core.messages import HumanMessage, AIMessage
 try:
     import bcrypt
@@ -72,6 +86,9 @@ except ImportError:
 
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+import json
+import time
 
 try:
     import jwt
@@ -122,6 +139,11 @@ if not SECRET_KEY or SECRET_KEY == "change-me":
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
+# Debug logging configuration
+DEBUG_LOGGING = os.getenv("DEBUG_LOGGING", "false").lower() == "true"
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.DEBUG if DEBUG_LOGGING else logging.INFO)
+
 # User Storage now handled by PostgreSQL database
 
 # Password hashing utilities
@@ -162,18 +184,50 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def verify_token(token: str) -> Optional[str]:
-    """Verify JWT token and return username"""
+def verify_token(token: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Verify JWT token and return (username, user_id).
+    
+    Phase 2.6: Enhanced to return both username and user_id if present.
+    Maintains backward compatibility - returns (username, None) for old tokens.
+    
+    Returns:
+        Tuple of (username: Optional[str], user_id: Optional[str])
+    """
     if jwt is None:
-        return None
+        return None, None
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
+        user_id: Optional[str] = payload.get("user_id")  # Phase 2.6: Extract user_id if present
+        
+        # Debug logging (Phase 1.2): Log token verification details
+        if DEBUG_LOGGING or username is None:
+            log_data = {
+                "event": "token_verification",
+                "username": username,
+                "has_user_id": "user_id" in payload,
+                "user_id": user_id,
+                "token_expired": False,
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            if "exp" in payload:
+                exp_time = datetime.utcnow().timestamp()
+                log_data["token_expired"] = payload["exp"] < exp_time
+                log_data["expires_at"] = datetime.fromtimestamp(payload["exp"]).isoformat()
+            logger.debug(f"[AUTH] Token verification: {json.dumps(log_data)}")
+        
         if username is None:
-            return None
-        return username
-    except jwt.PyJWTError:
-        return None
+            return None, None
+        return username, user_id
+    except jwt.ExpiredSignatureError:
+        if DEBUG_LOGGING:
+            logger.debug(f"[AUTH] Token expired: {json.dumps({'event': 'token_expired', 'timestamp': datetime.utcnow().isoformat()})}")
+        return None, None
+    except jwt.PyJWTError as e:
+        if DEBUG_LOGGING:
+            logger.debug(f"[AUTH] Token validation error: {json.dumps({'event': 'token_error', 'error_type': type(e).__name__, 'timestamp': datetime.utcnow().isoformat()})}")
+        return None, None
 
 # OAuth2 Configuration
 oauth2_scheme = OAuth2PasswordBearer(
@@ -195,20 +249,71 @@ def authenticate_user(username: str, password: str, db: Session):
     return None
 
 def get_current_user_oauth2(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
-    """Get current user from OAuth2 token"""
+    """
+    Get current user from OAuth2 token.
+    
+    Phase 2.7: Enhanced to use user_id from token if available for faster lookup.
+    Validates token user_id matches database user.id for security.
+    Falls back to username lookup for backward compatibility.
+    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
     
-    username = verify_token(token)
+    username, token_user_id = verify_token(token)
     if username is None:
         raise credentials_exception
     
-    user = db.query(User).filter(User.username == username).first()
+    # Phase 2.7: Use user_id from token if available (faster lookup)
+    start_time = time.time()
+    if token_user_id:
+        # Try lookup by user_id first (faster)
+        try:
+            import uuid as uuid_lib
+            user_id_uuid = uuid_lib.UUID(token_user_id)
+            user = db.query(User).filter(User.id == user_id_uuid).first()
+            
+            # Security check: Validate token user_id matches username
+            if user and user.username != username:
+                if DEBUG_LOGGING:
+                    logger.warning(f"[AUTH] Token user_id mismatch: token_user_id={token_user_id}, token_username={username}, db_username={user.username}")
+                # Fallback to username lookup for security
+                user = None
+        except (ValueError, TypeError):
+            # Invalid UUID format in token - fallback to username lookup
+            user = None
+    else:
+        user = None
+    
+    # Fallback to username lookup (backward compatibility or if user_id lookup failed)
+    if not user:
+        user = db.query(User).filter(User.username == username).first()
+    
+    lookup_time = (time.time() - start_time) * 1000  # Convert to ms
+    
+    if DEBUG_LOGGING or user is None:
+        log_data = {
+            "event": "user_lookup",
+            "username": username,
+            "token_user_id": token_user_id,
+            "user_found": user is not None,
+            "user_id": str(user.id) if user else None,
+            "lookup_method": "user_id" if token_user_id and user else "username",
+            "lookup_time_ms": round(lookup_time, 2),
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        logger.debug(f"[AUTH] User lookup: {json.dumps(log_data)}")
+    
     if user is None:
         raise credentials_exception
+    
+    # Phase 2.7: Validate token user_id matches database user.id (security check)
+    if token_user_id and str(user.id) != token_user_id:
+        if DEBUG_LOGGING:
+            logger.warning(f"[AUTH] Token user_id validation failed: token_user_id={token_user_id}, db_user_id={user.id}")
+        # Still allow access but log warning (token might be from old format)
     
     if not user.is_active:
         raise HTTPException(
@@ -250,15 +355,6 @@ def get_current_user_basic(username: str = Depends(oauth2_scheme)):
     )
 
 
-class input(BaseModel):
-    query:str
-    url:Optional[HttpUrl] = None
-    session_id: Optional[str] = None  # For session continuity
-
-class AgentResponse(BaseModel):
-    answer: str
-    session_id: str
-    video_context: Optional[str] = None
 
 # User Authentication Models
 class UserSignup(BaseModel):
@@ -284,14 +380,50 @@ class TokenData(BaseModel):
     username: Optional[str] = None
     scopes: list[str] = []
 
-class UserInDB(BaseModel):
-    username: str
-    email: str
-    hashed_password: str
-    created_at: str
-    is_active: bool = True
-    scopes: list[str] = ["read", "write"]  # OAuth2 
+# ============================================================================
+# SCHEMA 2 PYDANTIC MODELS
+# ============================================================================
+
+class ConversationInput(BaseModel):
+    """Input model for Schema 2 conversation requests"""
+    video_url: Optional[HttpUrl] = None
+    video_id: Optional[str] = None
+    conversation_id: Optional[str] = None  # For resuming existing conversation
+    query: str
     
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "video_url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+                "query": "What is this video about?",
+                "conversation_id": None
+            }
+        }
+
+
+class ConversationResponse(BaseModel):
+    """Response model for Schema 2 conversation"""
+    conversation_id: str
+    video_id: str
+    video_title: str
+    user_message: str
+    assistant_message: str
+    message_index: int
+    created_at: str
+
+
+class ConversationMessageResponse(BaseModel):
+    """Response model for individual message"""
+    id: str
+    conversation_id: str
+    user_id: str
+    video_id: str
+    message_index: int
+    role: str  # "user" | "assistant" | "system"
+    content: str
+    content_length: int
+    tokens_estimate: Optional[int]
+    created_at: str
 
 
 
@@ -378,7 +510,125 @@ if YOUTUBE_COOKIES:
     cookie_jar = parse_cookie_string(YOUTUBE_COOKIES)
     GLOBAL_HTTP_CLIENT.cookies.update(cookie_jar)
 
-model = ChatOpenAI(model="gpt-4.1-mini")  # Uses OPENAI_API_KEY from environment
+model = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"))  # Uses OPENAI_API_KEY from environment
+
+# ============================================================================
+# AGENT PROMPT CONSTRUCTION
+# ============================================================================
+
+def build_react_agent_prompt(base_template: Optional[str] = None) -> PromptTemplate:
+    """
+    Build ReAct agent prompt with detailed, pointwise instructions.
+    
+    Keeps all detailed instructions as requested - pointwise, precise, and detailed.
+    Organizes prompt for maintainability while preserving all essential guidance.
+    
+    Args:
+        base_template: Optional base template from LangChain hub. If None, uses complete fallback.
+    
+    Returns:
+        PromptTemplate configured with all detailed agent instructions.
+    """
+    # Common detailed instructions section (used in both enhanced and fallback)
+    detailed_instructions = """
+
+CRITICAL: Tool calling format rules:
+- Action and Action Input must be on SEPARATE lines
+- Do NOT use function call syntax like tool_name("input")
+- CORRECT format:
+  Action: youtube_rag_tool
+  Action Input: "what is asyncio?"
+- INCORRECT format (DO NOT USE):
+  Action: youtube_rag_tool("what is asyncio?")
+  Action Input: youtube_rag_tool("what is asyncio?")
+
+CRITICAL: Query Intent Analysis and Tool Selection:
+1. FIRST, analyze the query intent:
+   - Is this a time-sensitive question? (e.g., "latest", "recent", "updates", "new features", "current", "2024", "2025")
+   - Is this a general knowledge question about a topic? (e.g., "explain", "what is", "how does", "tell me about")
+
+2. Tool Selection Strategy:
+   - For GENERAL questions: Use youtube_rag_tool ONCE. Read the FIRST LINE of the Observation. If it says "FINAL_ANSWER_REQUIRED", STOP IMMEDIATELY. Your next Thought MUST be "I now know the final answer" then synthesize a COMPREHENSIVE final answer using ALL context. DO NOT call any tools again.
+   - For TIME-SENSITIVE questions: Use youtube_rag_tool FIRST. Read the FIRST LINE of the Observation. If it says "NEXT_ACTION_REQUIRED" and "NEXT_STEP: Call google_search_tool NOW", call google_search_tool next. After google_search_tool returns "FINAL_ANSWER_REQUIRED", STOP IMMEDIATELY. Your next Thought MUST be "I now know the final answer" then synthesize a COMPREHENSIVE answer from both sources.
+
+3. CRITICAL Tool Result Analysis (READ THE FIRST LINE OF OBSERVATION):
+   - After EACH tool call, you MUST read the FIRST LINE of the Observation IMMEDIATELY:
+     * If FIRST LINE contains "FINAL_ANSWER_REQUIRED" → STOP ALL TOOL CALLS. Your next Thought MUST be "I now know the final answer" and then provide Final Answer. DO NOT call any more tools. DO NOT call the same tool again.
+     * If FIRST LINE contains "NEXT_ACTION_REQUIRED" → Read the "NEXT_STEP:" line and follow it exactly:
+       - If it says "Call google_search_tool NOW" → Call google_search_tool immediately
+       - If it says "Provide Final Answer NOW" → STOP ALL TOOL CALLS. Your next Thought MUST be "I now know the final answer" and then provide Final Answer.
+     * If Observation says "No relevant information found" → Use google_search_tool or provide final answer
+   - CRITICAL LOOP PREVENTION:
+     * If you see "FINAL_ANSWER_REQUIRED" in ANY Observation, you MUST STOP and provide Final Answer
+     * DO NOT call the same tool again if you already received "FINAL_ANSWER_REQUIRED"
+     * DO NOT call youtube_rag_tool again after it returns "FINAL_ANSWER_REQUIRED"
+     * Check your scratchpad: if you already called a tool and got "FINAL_ANSWER_REQUIRED", provide Final Answer immediately
+   - CRITICAL: When providing Final Answer:
+     * Your Thought MUST be: "I now know the final answer"
+     * SYNTHESIZE comprehensively - don't just summarize
+     * Use ALL relevant context from the Observation
+     * Include specific details, examples, and key points from the context
+     * Structure your answer clearly with proper organization
+     * Be thorough and detailed - the user wants a complete understanding
+   - CRITICAL: After calling google_search_tool, you will receive "FINAL_ANSWER_REQUIRED" - this means you have BOTH video context AND web search results. STOP ALL TOOL CALLS. Your next Thought MUST be "I now know the final answer" and then synthesize a COMPREHENSIVE final answer from both sources.
+   - The Observation format is: [INSTRUCTION with plain text markers] followed by [context preview]
+   - READ THE FIRST LINE FIRST - it tells you exactly what to do next
+   - DO NOT call the same tool twice with the same input
+   - DO NOT call youtube_rag_tool again after it returns "FINAL_ANSWER_REQUIRED"
+
+4. Tool Call Limits:
+   - youtube_rag_tool: Maximum 1 call per query (analyze result and decide next step)
+   - google_search_tool: Maximum 1 call per query (only when needed based on youtube_rag_tool result or for time-sensitive queries)
+
+5. Tool Call History Tracking:
+   - Before calling ANY tool, check your previous actions in the scratchpad
+   - The scratchpad format is: Thought → Action → Action Input → Observation → Thought (repeat)
+   - If you see "Action: youtube_rag_tool" already executed → DO NOT call it again, check the Observation to see what to do next
+   - If you see "Action: google_search_tool" already executed → Provide Final Answer immediately (you have all information: video context + web search results)
+   - If you see both tools already called → You MUST provide Final Answer (no more tool calls needed)
+   - Use this history to avoid redundant tool calls and prevent looping
+
+Always use the CORRECT format with Action and Action Input on separate lines.
+"""
+    
+    # Base template from hub or fallback
+    if base_template:
+        # Enhance hub template with detailed instructions
+        enhanced_template = base_template + detailed_instructions
+        return PromptTemplate.from_template(enhanced_template)
+    else:
+        # Complete fallback prompt with all details
+        fallback_template = """Answer the following questions as best you can. You have access to the following tools:
+
+{tools}
+
+Use the following format:
+
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+
+CRITICAL: When Observation contains "FINAL_ANSWER_REQUIRED", you MUST stop calling tools immediately:
+Example:
+Action: youtube_rag_tool_v2
+Action Input: "What is discussed in this video?"
+Observation: FINAL_ANSWER_REQUIRED - STOP ALL TOOL CALLS NOW. Your next Thought MUST be "I now know the final answer" then provide Final Answer.
+Thought: I now know the final answer
+Final Answer: [Your comprehensive answer here]
+
+Thought: I now know the final answer
+Final Answer: Provide a comprehensive, detailed answer that synthesizes all relevant context from the observations. Use specific details, examples, and key points. Structure your answer clearly and be thorough.
+""" + detailed_instructions + """
+Begin!
+
+Question: {input}
+Thought:{agent_scratchpad}
+"""
+        return PromptTemplate.from_template(fallback_template)
+
 
 # Load agent prompt once at startup (cache it)
 try:
@@ -420,201 +670,24 @@ try:
         original_template = None
     
     if original_template:
-        # We have a valid template - enhance it
-        enhanced_template = original_template + """
-
-CRITICAL: Tool calling format rules:
-- Action and Action Input must be on SEPARATE lines
-- Do NOT use function call syntax like tool_name("input")
-- CORRECT format:
-  Action: youtube_rag_tool
-  Action Input: "what is asyncio?"
-- INCORRECT format (DO NOT USE):
-  Action: youtube_rag_tool("what is asyncio?")
-  Action Input: youtube_rag_tool("what is asyncio?")
-
-CRITICAL: Query Intent Analysis and Tool Selection:
-1. FIRST, analyze the query intent:
-   - Is this a time-sensitive question? (e.g., "latest", "recent", "updates", "new features", "current", "2024", "2025")
-   - Is this a general knowledge question about a topic? (e.g., "explain", "what is", "how does", "tell me about")
-
-2. Tool Selection Strategy:
-   - For GENERAL questions: Use youtube_rag_tool ONCE. Analyze the result. If it says "✅ FINAL ANSWER REQUIRED ✅", IMMEDIATELY synthesize the final answer. DO NOT call it again.
-   - For TIME-SENSITIVE questions: Use youtube_rag_tool FIRST. Analyze the result. If it says "🚨 NEXT ACTION REQUIRED 🚨" and "→ NEXT STEP: Call google_search_tool NOW", call google_search_tool next, then synthesize both sources.
-
-3. CRITICAL Tool Result Analysis (READ THE FIRST 3 LINES OF OBSERVATION):
-   - After EACH tool call, you MUST read the FIRST 3 lines of the Observation:
-     * If Observation contains "✅ FINAL ANSWER REQUIRED ✅" → IMMEDIATELY provide Final Answer (DO NOT call any more tools)
-     * If Observation contains "🚨 NEXT ACTION REQUIRED 🚨" → Read the "→ NEXT STEP:" line and follow it exactly:
-       - If it says "Call google_search_tool NOW" → Call google_search_tool immediately
-       - If it says "Provide Final Answer NOW" → Provide Final Answer immediately
-     * If Observation says "No relevant information found" → Use google_search_tool or provide final answer
-   - CRITICAL: After calling google_search_tool, you will receive "✅ FINAL ANSWER REQUIRED ✅" - this means you have BOTH video context AND web search results. IMMEDIATELY synthesize the final answer from both sources. DO NOT call youtube_rag_tool again.
-   - CRITICAL: Check your previous actions in the scratchpad - if you already called youtube_rag_tool, DO NOT call it again. If you already called google_search_tool, provide Final Answer.
-   - The Observation format is: [INSTRUCTION with emoji markers] followed by [context preview]
-   - READ THE FIRST 3 LINES FIRST - they tell you exactly what to do next
-   - DO NOT call the same tool twice with the same input
-   - DO NOT call youtube_rag_tool again after it returns context - follow the "→ NEXT STEP:" instruction
-
-4. Tool Call Limits:
-   - youtube_rag_tool: Maximum 1 call per query (analyze result and decide next step)
-   - google_search_tool: Maximum 1 call per query (only when needed based on youtube_rag_tool result or for time-sensitive queries)
-
-5. Tool Call History Tracking:
-   - Before calling ANY tool, check your previous actions in the scratchpad
-   - The scratchpad format is: Thought → Action → Action Input → Observation → Thought (repeat)
-   - If you see "Action: youtube_rag_tool" already executed → DO NOT call it again, check the Observation to see what to do next
-   - If you see "Action: google_search_tool" already executed → Provide Final Answer immediately (you have all information: video context + web search results)
-   - If you see both tools already called → You MUST provide Final Answer (no more tool calls needed)
-   - Use this history to avoid redundant tool calls and prevent looping
-
-Always use the CORRECT format with Action and Action Input on separate lines.
-"""
-        REACT_AGENT_PROMPT = PromptTemplate.from_template(enhanced_template)
+        # We have a valid template - use function to build prompt
+        REACT_AGENT_PROMPT = build_react_agent_prompt(base_template=original_template)
         print("[OK] Agent prompt loaded from LangChain hub and enhanced with format instructions")
     else:
-        # No valid template extracted - use fallback prompt
+        # No valid template extracted - use fallback prompt via function
         print("[WARN] Could not extract valid template from hub, using fallback prompt")
-        REACT_AGENT_PROMPT = PromptTemplate.from_template("""
-Answer the following questions as best you can. You have access to the following tools:
-
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-CRITICAL: Tool calling format rules:
-- Action and Action Input must be on SEPARATE lines
-- Do NOT use function call syntax like tool_name("input")
-- CORRECT format:
-  Action: youtube_rag_tool
-  Action Input: "what is asyncio?"
-- INCORRECT format (DO NOT USE):
-  Action: youtube_rag_tool("what is asyncio?")
-
-CRITICAL: Query Intent Analysis and Tool Selection:
-1. FIRST, analyze the query intent:
-   - Is this a time-sensitive question? (e.g., "latest", "recent", "updates", "new features", "current", "2024", "2025")
-   - Is this a general knowledge question about a topic? (e.g., "explain", "what is", "how does", "tell me about")
-
-2. Tool Selection Strategy:
-   - For GENERAL questions: Use youtube_rag_tool ONCE. Analyze the result. If it says "✅ FINAL ANSWER REQUIRED ✅", IMMEDIATELY synthesize the final answer. DO NOT call it again.
-   - For TIME-SENSITIVE questions: Use youtube_rag_tool FIRST. Analyze the result. If it says "🚨 NEXT ACTION REQUIRED 🚨" and "→ NEXT STEP: Call google_search_tool NOW", call google_search_tool next, then synthesize both sources.
-
-3. CRITICAL Tool Result Analysis (READ THE FIRST 3 LINES OF OBSERVATION):
-   - After EACH tool call, you MUST read the FIRST 3 lines of the Observation:
-     * If Observation contains "✅ FINAL ANSWER REQUIRED ✅" → IMMEDIATELY provide Final Answer (DO NOT call any more tools)
-     * If Observation contains "🚨 NEXT ACTION REQUIRED 🚨" → Read the "→ NEXT STEP:" line and follow it exactly:
-       - If it says "Call google_search_tool NOW" → Call google_search_tool immediately
-       - If it says "Provide Final Answer NOW" → Provide Final Answer immediately
-     * If Observation says "No relevant information found" → Use google_search_tool or provide final answer
-   - CRITICAL: After calling google_search_tool, you will receive "✅ FINAL ANSWER REQUIRED ✅" - this means you have BOTH video context AND web search results. IMMEDIATELY synthesize the final answer from both sources. DO NOT call youtube_rag_tool again.
-   - CRITICAL: Check your previous actions in the scratchpad - if you already called youtube_rag_tool, DO NOT call it again. If you already called google_search_tool, provide Final Answer.
-   - The Observation format is: [INSTRUCTION with emoji markers] followed by [context preview]
-   - READ THE FIRST 3 LINES FIRST - they tell you exactly what to do next
-   - DO NOT call the same tool twice with the same input
-   - DO NOT call youtube_rag_tool again after it returns context - follow the "→ NEXT STEP:" instruction
-
-4. Tool Call Limits:
-   - youtube_rag_tool: Maximum 1 call per query (analyze result and decide next step)
-   - google_search_tool: Maximum 1 call per query (only when needed based on youtube_rag_tool result or for time-sensitive queries)
-
-5. Tool Call History Tracking:
-   - Before calling ANY tool, check your previous actions in the scratchpad
-   - The scratchpad format is: Thought → Action → Action Input → Observation → Thought (repeat)
-   - If you see "Action: youtube_rag_tool" already executed → DO NOT call it again, check the Observation to see what to do next
-   - If you see "Action: google_search_tool" already executed → Provide Final Answer immediately (you have all information: video context + web search results)
-   - If you see both tools already called → You MUST provide Final Answer (no more tool calls needed)
-   - Use this history to avoid redundant tool calls and prevent looping
-
-Begin!
-
-Question: {input}
-Thought:{agent_scratchpad}
-""")
+        REACT_AGENT_PROMPT = build_react_agent_prompt(base_template=None)
         print("[OK] Fallback prompt loaded")
 except Exception as e:
     print(f"[WARN] Could not load agent prompt from hub: {e}")
     print("   Using fallback prompt")
-    # Fallback prompt if hub is unavailable
-    # PromptTemplate already imported at top of file
-    REACT_AGENT_PROMPT = PromptTemplate.from_template("""
-Answer the following questions as best you can. You have access to the following tools:
-
-{tools}
-
-Use the following format:
-
-Question: the input question you must answer
-Thought: you should always think about what to do
-Action: the action to take, should be one of [{tool_names}]
-Action Input: the input to the action
-Observation: the result of the action
-... (this Thought/Action/Action Input/Observation can repeat N times)
-Thought: I now know the final answer
-Final Answer: the final answer to the original input question
-
-CRITICAL: Tool calling format rules:
-- Action and Action Input must be on SEPARATE lines
-- Do NOT use function call syntax like tool_name("input")
-- CORRECT format:
-  Action: youtube_rag_tool
-  Action Input: "what is asyncio?"
-- INCORRECT format (DO NOT USE):
-  Action: youtube_rag_tool("what is asyncio?")
-
-CRITICAL: Query Intent Analysis and Tool Selection:
-1. FIRST, analyze the query intent:
-   - Is this a time-sensitive question? (e.g., "latest", "recent", "updates", "new features", "current", "2024", "2025")
-   - Is this a general knowledge question about a topic? (e.g., "explain", "what is", "how does", "tell me about")
-
-2. Tool Selection Strategy:
-   - For GENERAL questions: Use youtube_rag_tool ONCE. Analyze the result. If it says "✅ FINAL ANSWER REQUIRED ✅", IMMEDIATELY synthesize the final answer. DO NOT call it again.
-   - For TIME-SENSITIVE questions: Use youtube_rag_tool FIRST. Analyze the result. If it says "🚨 NEXT ACTION REQUIRED 🚨" and "→ NEXT STEP: Call google_search_tool NOW", call google_search_tool next, then synthesize both sources.
-
-3. CRITICAL Tool Result Analysis (READ THE FIRST 3 LINES OF OBSERVATION):
-   - After EACH tool call, you MUST read the FIRST 3 lines of the Observation:
-     * If Observation contains "✅ FINAL ANSWER REQUIRED ✅" → IMMEDIATELY provide Final Answer (DO NOT call any more tools)
-     * If Observation contains "🚨 NEXT ACTION REQUIRED 🚨" → Read the "→ NEXT STEP:" line and follow it exactly:
-       - If it says "Call google_search_tool NOW" → Call google_search_tool immediately
-       - If it says "Provide Final Answer NOW" → Provide Final Answer immediately
-     * If Observation says "No relevant information found" → Use google_search_tool or provide final answer
-   - CRITICAL: After calling google_search_tool, you will receive "✅ FINAL ANSWER REQUIRED ✅" - this means you have BOTH video context AND web search results. IMMEDIATELY synthesize the final answer from both sources. DO NOT call youtube_rag_tool again.
-   - CRITICAL: Check your previous actions in the scratchpad - if you already called youtube_rag_tool, DO NOT call it again. If you already called google_search_tool, provide Final Answer.
-   - The Observation format is: [INSTRUCTION with emoji markers] followed by [context preview]
-   - READ THE FIRST 3 LINES FIRST - they tell you exactly what to do next
-   - DO NOT call the same tool twice with the same input
-   - DO NOT call youtube_rag_tool again after it returns context - follow the "→ NEXT STEP:" instruction
-
-4. Tool Call Limits:
-   - youtube_rag_tool: Maximum 1 call per query (analyze result and decide next step)
-   - google_search_tool: Maximum 1 call per query (only when needed based on youtube_rag_tool result or for time-sensitive queries)
-
-5. Tool Call History Tracking:
-   - Before calling ANY tool, check your previous actions in the scratchpad
-   - The scratchpad format is: Thought → Action → Action Input → Observation → Thought (repeat)
-   - If you see "Action: youtube_rag_tool" already executed → DO NOT call it again, check the Observation to see what to do next
-   - If you see "Action: google_search_tool" already executed → Provide Final Answer immediately (you have all information: video context + web search results)
-   - If you see both tools already called → You MUST provide Final Answer (no more tool calls needed)
-   - Use this history to avoid redundant tool calls and prevent looping
-
-Begin!
-
-Question: {input}
-Thought:{agent_scratchpad}
-""")
+    # Fallback prompt if hub is unavailable - use function to build it
+    REACT_AGENT_PROMPT = build_react_agent_prompt(base_template=None)
 
 #Pinecone Database setting-----------------------------------------------------------------------------
 # Initialize Pinecone client - using shared index with namespaces
 SHARED_INDEX_NAME = "augustus-videos-integrated"
+CATALOG_INDEX_NAME = os.getenv("CATALOG_INDEX_NAME", "agentic-catalog-index")
 
 if PINECONE_API_KEY:
     try:
@@ -636,6 +709,7 @@ MAX_CHUNKS_PER_VIDEO = 10           # Maximum chunks from same video (ensures di
 MAX_CONTEXT_LENGTH = 40000          # Maximum characters in context (prevents LLM overflow)
 BASE_TOP_K = 12                    # Base number of results for youtube_rag_tool (already used: 12*2 = 24 candidates)
 FALLBACK_TOP_K = 10                # Base number of results for fallback RAG (already used: 10*2 = 20 candidates)
+MAX_QUERY_LENGTH = 2000            # Maximum characters allowed in user query (prevents context window exhaustion)
 
 parser = StrOutputParser()
 
@@ -713,10 +787,69 @@ def fetchTranscript(url:str)->list:
     return l
 
 
-prompt=PromptTemplate(
-        template="<role>You are an helpful assistant, you only know about the context provided to you.</role>\n <task>Answer the {question} using context</task>\n <instructions>\n1)Query the  vector store to complete the task.\n2)Don't use the internet, or your internal knowledge to answer the question, use only the vector store.\n3)Expand on your answers in simple yet explanatory way.</instructions><context>Here is the necessary info-\n{context}</context>",
-        input_variables=['question','context']
-)
+def generate_video_synopsis(transcript: str, video_title: str = "YouTube Video") -> Tuple[str, List[str]]:
+    """
+    Generate 250-300 char synopsis and 3-5 topic keywords from transcript using LLM.
+    
+    Args:
+        transcript: Full video transcript
+        video_title: Video title for context
+    
+    Returns:
+        Tuple of (synopsis: str, topics: List[str])
+    """
+    try:
+        # Truncate transcript for cost efficiency (first ~4000 chars usually sufficient)
+        transcript_preview = transcript[:4000] if len(transcript) > 4000 else transcript
+        
+        synopsis_prompt = f"""Analyze this video transcript and provide:
+1. A concise synopsis (250-300 characters) summarizing the main topic and key points
+2. 3-5 topic keywords (single words or short phrases, lowercase)
+
+Video Title: {video_title}
+
+Transcript:
+{transcript_preview}
+
+Format your response as:
+SYNOPSIS: [your 250-300 char synopsis]
+TOPICS: [keyword1, keyword2, keyword3, ...]"""
+        
+        response = model.invoke(synopsis_prompt)
+        content = response.content if hasattr(response, 'content') else str(response)
+        
+        # Parse response
+        synopsis = ""
+        topics = []
+        
+        for line in content.split('\n'):
+            line = line.strip()
+            if line.startswith('SYNOPSIS:'):
+                synopsis = line.replace('SYNOPSIS:', '').strip()
+            elif line.startswith('TOPICS:'):
+                topics_str = line.replace('TOPICS:', '').strip()
+                topics = [t.strip().lower() for t in topics_str.split(',') if t.strip()]
+        
+        # Validate and trim synopsis
+        if not synopsis:
+            synopsis = f"Video about {video_title}"[:300]
+        elif len(synopsis) > 300:
+            synopsis = synopsis[:297] + "..."
+        elif len(synopsis) < 250:
+            # Pad if too short (acceptable, not critical)
+            pass
+        
+        # Validate topics
+        if not topics or len(topics) < 3:
+            topics = ["video", "content", "information"]
+        elif len(topics) > 5:
+            topics = topics[:5]
+        
+        return synopsis, topics
+    
+    except Exception as e:
+        print(f"[WARN] Synopsis generation failed: {e}, using defaults")
+        return f"Video: {video_title}"[:300], ["video", "content"]
 
 
 def format_docs(retrieved_docs, max_length=None):
@@ -741,6 +874,62 @@ def format_docs(retrieved_docs, max_length=None):
         context_text = context_text[:max_length] + "..."
     
     return context_text
+
+
+def format_citations_from_docs(docs: List[Document], db_session_or_factory: Callable[[], Session] | Session) -> Dict[str, Dict[str, str]]:
+    """
+    Extract unique video citations from documents.
+    
+    Args:
+        docs: List of Document objects with video_id in metadata
+        db_session_or_factory: Either a Session object or a callable that returns a Session
+                              (for use in tool closures where session may become stale)
+    
+    Returns:
+        Dict mapping video_id to {title, url, channel} for citations
+    """
+    video_ids = set()
+    for doc in docs:
+        vid_id = doc.metadata.get('video_id')
+        if vid_id and vid_id != "GENERAL":
+            video_ids.add(vid_id)
+    
+    # Get database session (create new one if factory provided, otherwise use passed session)
+    if callable(db_session_or_factory):
+        db = db_session_or_factory()
+        should_close = True
+    else:
+        db = db_session_or_factory
+        should_close = False
+    
+    try:
+        citations = {}
+        for vid_id in video_ids:
+            catalog = db.query(VideosCatalog).filter(VideosCatalog.video_id == vid_id).first()
+            if catalog:
+                # Trim title to ~90 chars
+                title = catalog.video_title[:90] + "..." if len(catalog.video_title) > 90 else catalog.video_title
+                citations[vid_id] = {
+                    "title": title,
+                    "url": catalog.video_url,
+                    "channel": catalog.channel_title or ""
+                }
+            else:
+                print(f"[WARN] No catalog entry found for video_id: {vid_id}")
+        
+        # Check for duplicate titles (add channel name if duplicates)
+        titles = [c["title"] for c in citations.values()]
+        if len(titles) != len(set(titles)):
+            # Has duplicates - append channel names
+            for vid_id, info in citations.items():
+                if info["channel"]:
+                    info["title"] = f"{info['title']} ({info['channel']})"
+        
+        return citations
+    finally:
+        # Only close session if we created it (via factory)
+        if should_close:
+            db.close()
 
 
 def process_retrieval_results(docs, min_score=None, max_per_video=None, max_context_length=None):
@@ -883,6 +1072,31 @@ def get_shared_index():
     return pc.Index(SHARED_INDEX_NAME)
 
 
+def get_catalog_index():
+    """
+    Get Pinecone catalog index for video synopsis search.
+    
+    Returns:
+        Pinecone Index object for the catalog index
+        
+    Raises:
+        HTTPException: If Pinecone is not available or catalog index doesn't exist
+    """
+    if pc is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Pinecone service is not available. Please configure PINECONE_API_KEY in .env file."
+        )
+    
+    if not pc.has_index(CATALOG_INDEX_NAME):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Catalog index '{CATALOG_INDEX_NAME}' not found. Create it with: pc index create -n {CATALOG_INDEX_NAME} -m cosine -c aws -r us-east-1 --model llama-text-embed-v2 --field_map text=content"
+        )
+    
+    return pc.Index(CATALOG_INDEX_NAME)
+
+
 # Helper function to generate namespace for user
 def get_user_namespace(username: str) -> str:
     """
@@ -1012,7 +1226,369 @@ def batch_upsert_records(index, namespace, records, batch_size=96):
         exponential_backoff_retry(
             lambda: index.upsert_records(namespace, batch)
         )
-        time.sleep(0.1)  # Rate limiting
+        time.sleep(0.01)  # Rate limiting (reduced from 0.1s for better performance)
+
+
+def upsert_catalog_to_pinecone(
+    video_id: str,
+    synopsis: str,
+    video_title: str,
+    topics: List[str],
+    namespace: str,
+    channel_title: Optional[str] = None
+) -> bool:
+    """
+    Upsert single catalog entry to Pinecone catalog index.
+    Uses user-specific namespace for per-user catalog isolation.
+    
+    Args:
+        video_id: YouTube video ID (11 chars)
+        synopsis: Video synopsis (250-300 chars)
+        video_title: Video title
+        topics: List of topic keywords (3-5 items)
+        namespace: User namespace for catalog isolation
+        channel_title: Optional channel name
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        catalog_index = get_catalog_index()
+        
+        # Prepare catalog record
+        record = {
+            "_id": video_id,
+            "content": synopsis,  # This gets embedded by Pinecone
+            "video_id": video_id,
+            "video_title": video_title,
+            "topics": topics,
+            "channel_title": channel_title or ""
+        }
+        
+        # Upsert to catalog index (user-specific namespace for isolation)
+        exponential_backoff_retry(
+            lambda: catalog_index.upsert_records(namespace, [record])
+        )
+        
+        print(f"[OK] Synced catalog entry to Pinecone for video {video_id} in namespace {namespace}")
+        return True
+    
+    except Exception as e:
+        print(f"[ERROR] Failed to sync catalog to Pinecone for {video_id}: {e}")
+        return False
+
+
+def embed_video_if_needed(
+    db: Session,
+    video_id: str,
+    video_url: str,
+    user_id,
+    index,
+    namespace: str
+) -> Tuple[str, str]:
+    """
+    Embed video into Pinecone if not already embedded.
+    Also creates/updates videos_catalog entry with basic metadata.
+    
+    Args:
+        db: Database session
+        video_id: YouTube video ID (11 chars)
+        video_url: Full YouTube URL
+        user_id: User ID for tracking
+        index: Pinecone Index object
+        namespace: Pinecone namespace for user
+    
+    Returns:
+        Tuple of (video_id, video_title)
+    
+    Raises:
+        HTTPException: If transcript fetch or embedding fails
+    """
+    # Check if video already embedded in Pinecone
+    if check_video_exists_in_pinecone(index, namespace, video_id):
+        print(f"[INFO] Video {video_id} already embedded, skipping transcript fetch")
+        
+        # Try to get title from catalog, fallback to generic
+        catalog = db.query(VideosCatalog).filter(
+            VideosCatalog.video_id == video_id
+        ).first()
+        video_title = catalog.video_title if catalog else "YouTube Video"
+        
+        return video_id, video_title
+    
+    # Video not found in Pinecone - fetch transcript and embed
+    print(f"[INFO] Video {video_id} not found in Pinecone, fetching transcript")
+    
+    # Fetch transcript
+    l = fetchTranscript(video_url)
+    transcript = l[0]
+    
+    # Generate synopsis and topics for catalog
+    print(f"[INFO] Generating synopsis for video {video_id}")
+    video_title = "YouTube Video"  # Default fallback
+    synopsis, topics = generate_video_synopsis(transcript, video_title)
+    print(f"[OK] Generated synopsis ({len(synopsis)} chars) and {len(topics)} topics")
+    
+    # Embed in Pinecone
+    parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
+    chunks = parent_splitter.create_documents([transcript])
+    
+    # Prepare records (text only - Pinecone embeds automatically)
+    records = []
+    for i, chunk in enumerate(chunks):
+        vector_id = f"{video_id}:{hashlib.sha1(chunk.page_content.encode('utf-8')).hexdigest()[:16]}"
+        records.append({
+            "_id": vector_id,
+            "content": chunk.page_content,
+            "video_id": video_id,
+            "doc_id": f"{video_id}:p{i}"
+        })
+    
+    # Defensive check: verify records don't already exist
+    already = False
+    if records:
+        probe_ids = [r["_id"] for r in records[:8]]
+        try:
+            result = index.fetch(namespace=namespace, ids=probe_ids)
+            already = len(result.records) > 0
+        except Exception:
+            already = False
+    
+    # Batch upsert with retry - must succeed before creating catalog entry
+    try:
+        if not already:
+            batch_upsert_records(index, namespace, records, batch_size=96)
+            print(f"[OK] Embedded video {video_id}")
+        else:
+            print(f"[INFO] Video {video_id} already embedded (defensive check triggered)")
+        
+        # Only create catalog entry if Pinecone embedding succeeded
+        # Create/update catalog entry with synopsis and topics
+        catalog = get_or_create_catalog_entry(
+            db=db,
+            video_id=video_id,
+            video_title=video_title,
+            video_url=video_url,
+            synopsis=synopsis,  # Now populated with LLM-generated synopsis
+            topics=topics,      # Now populated with LLM-generated topics
+            embedding_version="llama-text-embed-v2"
+        )
+        
+        # Sync catalog entry to Pinecone catalog index (per-user namespace)
+        upsert_catalog_to_pinecone(
+            video_id=video_id,
+            synopsis=synopsis,
+            video_title=video_title,
+            topics=topics,
+            namespace=namespace,  # User-specific namespace for catalog isolation
+            channel_title=None  # Could be extracted from YouTube API in future
+        )
+        
+        return video_id, catalog.video_title
+    
+    except Exception as e:
+        # If Pinecone embedding fails, don't create catalog entry to maintain consistency
+        print(f"[ERROR] Pinecone embedding failed for video {video_id}: {e}")
+        print(f"[ERROR] Skipping catalog entry creation to maintain data consistency")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to embed video: {str(e)}"
+        )
+
+
+def shortlist_videos_from_catalog(
+    query: str,
+    namespace: str,
+    top_k: int = 10,
+    top_n: int = 5
+) -> List[str]:
+    """
+    Search catalog index to shortlist relevant video IDs.
+    Uses user-specific namespace for per-user catalog isolation.
+    
+    Args:
+        query: User query text
+        namespace: User namespace for catalog search
+        top_k: Candidate pool size (default: 10)
+        top_n: Final shortlist size after reranking (default: 5)
+    
+    Returns:
+        List of video_id strings (max top_n items), empty list on error
+    """
+    try:
+        catalog_index = get_catalog_index()
+        
+        # Search catalog (user-specific namespace for isolation)
+        results = exponential_backoff_retry(
+            lambda: catalog_index.search(
+                namespace=namespace,  # User-specific catalog
+                query={
+                    "top_k": top_k,
+                    "inputs": {"text": query}
+                },
+                rerank={
+                    "model": "bge-reranker-v2-m3",
+                    "top_n": top_n,
+                    "rank_fields": ["content"]
+                }
+            )
+        )
+        
+        # Extract video_ids from results
+        video_ids = []
+        if results and 'result' in results and 'hits' in results['result']:
+            for hit in results['result']['hits']:
+                vid_id = hit.get('fields', {}).get('video_id')
+                if vid_id:
+                    video_ids.append(vid_id)
+        
+        print(f"[CATALOG] Shortlisted {len(video_ids)} videos for query: {query[:50]}... (namespace: {namespace})")
+        return video_ids
+    
+    except Exception as e:
+        print(f"[ERROR] Catalog shortlisting failed: {e}")
+        return []  # Return empty list, will trigger fallback
+
+
+def retrieve_for_general_tab(
+    chunks_index,
+    namespace: str,
+    query: str,
+    candidate_pool: int = 24,
+    top_n: int = 12,
+    max_per_video: int = 10,
+    min_shortlist_videos: int = 3
+) -> Tuple[List[Document], List[str]]:
+    """
+    General tab retrieval with catalog shortlisting.
+    
+    Steps:
+    1. Shortlist videos via catalog search
+    2. If shortlist < min_shortlist_videos, fall back to global chunk search
+    3. Otherwise, search chunks filtered by shortlisted video_ids
+    4. Apply diversity cap and score thresholding
+    
+    Args:
+        chunks_index: Pinecone chunks index
+        namespace: User namespace
+        query: User query
+        candidate_pool: Chunk candidates before reranking (default: 24)
+        top_n: Final chunks after reranking (default: 12)
+        max_per_video: Max chunks per video (default: 10)
+        min_shortlist_videos: Min videos for filtered search (default: 3)
+    
+    Returns:
+        Tuple of (documents: List[Document], shortlisted_video_ids: List[str])
+    """
+    # Step 1: Shortlist videos (using user-specific namespace)
+    shortlisted_video_ids = shortlist_videos_from_catalog(query, namespace, top_k=10, top_n=5)
+    
+    # Step 2: Fallback check
+    use_global_search = len(shortlisted_video_ids) < min_shortlist_videos
+    
+    if use_global_search:
+        print(f"[GENERAL] Shortlist too small ({len(shortlisted_video_ids)} videos), using global search")
+        filter_dict = None
+    else:
+        print(f"[GENERAL] Using filtered search with {len(shortlisted_video_ids)} shortlisted videos")
+        # Pinecone filter syntax for "video_id in list"
+        filter_dict = {"video_id": {"$in": shortlisted_video_ids}}
+    
+    # Step 3: Build query
+    query_dict = {
+        "top_k": candidate_pool,
+        "inputs": {"text": query}
+    }
+    
+    # Only add filter if exists (don't set to None)
+    if filter_dict:
+        query_dict["filter"] = filter_dict
+    
+    # Search chunks with reranking
+    try:
+        results = exponential_backoff_retry(
+            lambda: chunks_index.search(
+                namespace=namespace,
+                query=query_dict,
+                rerank={
+                    "model": "bge-reranker-v2-m3",
+                    "top_n": top_n,
+                    "rank_fields": ["content"]
+                }
+            )
+        )
+        
+        # Parse results
+        raw_docs = []
+        if results and 'result' in results and 'hits' in results['result']:
+            for hit in results['result']['hits']:
+                doc = Document(
+                    page_content=hit['fields']['content'],
+                    metadata={
+                        'video_id': hit['fields'].get('video_id'),
+                        'doc_id': hit['fields'].get('doc_id'),
+                        '_id': hit['_id'],
+                        '_score': hit['_score']
+                    }
+                )
+                raw_docs.append(doc)
+        
+        # Step 4-5: Post-processing (diversity, context length, lenient scoring)
+        final_docs = process_retrieval_results(
+            raw_docs,
+            min_score=0.5,  # Lenient threshold for General tab
+            max_per_video=max_per_video,
+            max_context_length=MAX_CONTEXT_LENGTH
+        )
+        
+        return final_docs, shortlisted_video_ids
+    
+    except Exception as e:
+        print(f"[ERROR] General tab retrieval failed: {e}")
+        return [], shortlisted_video_ids
+
+
+# ============================================================================
+# DATABASE INTEGRITY UTILITIES (Phase 4)
+# ============================================================================
+
+def check_conversation_ownership_integrity(db: Session, conversation_id) -> Dict[str, Any]:
+    """
+    Check if conversation has valid user_id reference.
+    
+    Phase 4.10: Utility function to check for orphaned conversations.
+    Used for diagnostic purposes to identify database integrity issues.
+    
+    Args:
+        db: Database session
+        conversation_id: Conversation UUID to check (can be str or UUID)
+    
+    Returns:
+        Dictionary with integrity check results:
+        - "exists": bool - Whether conversation exists
+        - "conversation_user_id": str - User ID that owns the conversation
+        - "user_exists": bool - Whether the user still exists in database
+        - "user_username": Optional[str] - Username if user exists
+    """
+    import uuid as uuid_lib
+    # Convert to UUID if string
+    if isinstance(conversation_id, str):
+        conversation_id = uuid_lib.UUID(conversation_id)
+    
+    conversation = db.query(VideoConversation).filter(
+        VideoConversation.conversation_id == conversation_id
+    ).first()
+    
+    if not conversation:
+        return {"exists": False}
+    
+    user = db.query(User).filter(User.id == conversation.user_id).first()
+    return {
+        "exists": True,
+        "conversation_user_id": str(conversation.user_id),
+        "user_exists": user is not None,
+        "user_username": user.username if user else None
+    }
 
 
 # Health check endpoint (no authentication required)
@@ -1132,9 +1708,11 @@ def signin(user_data: UserLogin, db: Session = Depends(get_db)):
     
     # Create access token with scopes
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Phase 2.5: Include user_id in token payload
     access_token = create_access_token(
         data={
             "sub": user_data.username,
+            "user_id": str(user.id),  # Phase 2.5: Add user_id for faster lookups
             "scopes": user.scopes
         }, 
         expires_delta=access_token_expires
@@ -1168,9 +1746,11 @@ def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(), db:
         )
     
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # Phase 2.5: Include user_id in token payload
     access_token = create_access_token(
         data={
             "sub": user.username,
+            "user_id": str(user.id),  # Phase 2.5: Add user_id for faster lookups
             "scopes": user.scopes
         }, 
         expires_delta=access_token_expires
@@ -1228,956 +1808,911 @@ def update_user_scopes(
     db.commit()
     return {"message": f"Scopes updated for user {username}", "scopes": scopes}
 
-#ingesting------------------------------------------------------------------------------------------------
-@app.post("/", response_model=AgentResponse)
-def answer_from_video(user_input: input, current_user: dict = Depends(require_scope("write")), db: Session = Depends(get_db)) -> dict:
+# ============================================================================
+# TOOL FACTORY FUNCTIONS
+# ============================================================================
+
+def create_youtube_rag_tool_v2(index, namespace: str, video_id: str):
     """
-    Intelligent Q&A with agent-based tool selection and persistent context.
+    Factory function to create youtube_rag_tool_v2 for video-scoped conversations.
     
-    Features:
-    - User-specific Pinecone indexes for data isolation
-    - Session-based conversation history (sliding window)
-    - Agent decides between YouTube RAG and web search
-    - Supports follow-up questions across requests
+    Args:
+        index: Pinecone index instance
+        namespace: User namespace for data isolation
+        video_id: Video ID to filter search results
     
-    Requires 'write' scope.
+    Returns:
+        LangChain tool for video RAG search
     """
-    # Check if Pinecone client is initialized
-    if pc is None:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Pinecone service is not available. Please configure PINECONE_API_KEY in .env file."
-        )
-    
-    # ========================================
-    # STEP 1: Session Management
-    # ========================================
-    
-    # Get user from database
-    user = db.query(User).filter(User.username == current_user["username"]).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Get or create session
-    session_id_input = user_input.session_id
-    session = None
-    
-    if session_id_input:
-        # Try to find the specific session requested
-        try:
-            session = db.query(UserSession).filter(
-                UserSession.session_id == session_id_input,
-                UserSession.user_id == user.id,
-                UserSession.is_active == True,
-                UserSession.expires_at > datetime.utcnow()
-            ).first()
-            
-            if session:
-                print(f"[INFO] Resuming session {session.session_id}")
-        except Exception as e:
-            print(f"[WARN] Invalid session_id format: {e}")
-            session = None
-    
-    # If no session found, try to auto-resume user's most recent session
-    if not session:
-        # Try to find user's most recent active session (auto-resume)
-        session = db.query(UserSession).filter(
-            UserSession.user_id == user.id,
-            UserSession.is_active == True,
-            UserSession.expires_at > datetime.utcnow()
-        ).order_by(UserSession.last_activity.desc()).first()
-        
-        if session:
-            print(f"[INFO] Auto-resumed most recent session {session.session_id}")
-        else:
-            # No active sessions - create new one
-            session = UserSession(user_id=user.id)
-            db.add(session)
-            db.commit()
-            db.refresh(session)
-            print(f"[INFO] Created new session {session.session_id} for user {user.username}")
-    
-    # ========================================
-    # STEP 2: Video Embedding (if URL provided)
-    # ========================================
-    
-    query = user_input.query
-    url = str(user_input.url) if user_input.url else None
-    current_video_id = None
-    
-    if url:
-        try:
-            # Extract video_id from URL first (no API call needed)
-            video_id = get_youtube_video_id(url)
-            if not video_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Invalid YouTube URL. Could not extract video ID."
-                )
-            
-            current_video_id = video_id
-            
-            # Get shared index and namespace
-            index = get_shared_index()
-            namespace = get_user_namespace(user.username)
-            
-            # Check if video already embedded in Pinecone (before fetching transcript)
-            if check_video_exists_in_pinecone(index, namespace, video_id):
-                print(f"[INFO] Video {video_id} already embedded, skipping transcript fetch")
-                # Update session with current video and continue to Q&A
-                session.current_video_id = video_id
-                session.current_video_url = url
-                session.last_activity = datetime.utcnow()
-                db.commit()
-            else:
-                # Video not found in Pinecone - fetch transcript and embed
-                print(f"[INFO] Video {video_id} not found in Pinecone, fetching transcript")
-                
-                # Fetch transcript
-                l = fetchTranscript(url)
-                transcript = l[0]
-                # video_id already extracted above, no need to get from l[1]
-                
-                # Embed in Pinecone
-                parent_splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=400)
-                chunks = parent_splitter.create_documents([transcript])
-                
-                # Prepare records (text only - Pinecone embeds automatically)
-                # Format matches AGENTS.md line 404-411
-                records = []
-                for i, chunk in enumerate(chunks):
-                    vector_id = f"{video_id}:{hashlib.sha1(chunk.page_content.encode('utf-8')).hexdigest()[:16]}"
-                    records.append({
-                        "_id": vector_id,
-                        "content": chunk.page_content,  # CRITICAL: Must match field_map (text=content)
-                        "video_id": video_id,            # Metadata (flat structure - AGENTS.md line 630-635)
-                        "doc_id": f"{video_id}:p{i}"     # Metadata (flat structure)
-                    })
-                    # Note: No nested objects allowed (AGENTS.md line 619-636)
-                    # All metadata must be flat: strings, ints, floats, bools, string lists only
-                
-                # Defensive check: verify records don't already exist (should rarely trigger since we checked above)
-                # This handles potential race conditions or check failures
-                already = False
-                if records:
-                    probe_ids = [r["_id"] for r in records[:8]]
-                    try:
-                        result = index.fetch(namespace=namespace, ids=probe_ids)
-                        # CRITICAL: Use result.records (not result.vectors) for integrated embeddings
-                        # AGENTS.md line 449: if result.records:
-                        already = len(result.records) > 0
-                    except Exception:
-                        already = False
-                
-                # Batch upsert with retry
-                # AGENTS.md line 416: index.upsert_records(namespace, records)
-                if not already:
-                    batch_upsert_records(index, namespace, records, batch_size=96)  # Max 96 per batch
-                    print(f"[OK] Embedded video {video_id} for user {user.username}")
-                else:
-                    print(f"[INFO] Video {video_id} already embedded (defensive check triggered)")
-                
-                # Update session with current video
-                session.current_video_id = video_id
-                session.current_video_url = url
-                session.last_activity = datetime.utcnow()
-                db.commit()
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
-    
-    # ========================================
-    # STEP 3: Build Agent Context from DB
-    # ========================================
-    
-    # Get recent messages for context
-    recent_messages = db.query(Message).filter(
-        Message.session_id == session.session_id
-    ).order_by(Message.message_index.desc()).limit(10).all()
-    recent_messages.reverse()  # Chronological order
-    
-    # Convert to LangChain format
-    history = [
-        HumanMessage(content=m.content) if m.message_type == 'human'
-        else AIMessage(content=m.content)
-        for m in recent_messages
-    ]
-    
-    # ========================================
-    # STEP 4: Create Context-Aware Tools
-    # ========================================
-    
-    # Capture context in closure
-    session_id_str = str(session.session_id)
-    username_str = user.username
-    current_vid = current_video_id or session.current_video_id
-    
-    # Get current date/time for time-sensitive queries
-    current_time = datetime.utcnow()
-    current_year = current_time.year
-    current_date_str = current_time.strftime("%Y-%m-%d")
-    
     @tool
-    def youtube_rag_tool(question: str) -> str:
+    def youtube_rag_tool_v2(query_text: str) -> str:
         """
         PRIORITY TOOL: Use this FIRST for any question about video content.
         
         Returns relevant context from YouTube videos for the agent to synthesize into an answer.
-        This tool searches across ALL videos processed by the user (including videos from previous sessions).
-        If the current session has a video_id, it will prioritize that video; otherwise, it searches
-        across all user videos.
+        This tool searches the specific video associated with this conversation only.
         
-        This tool retrieves and returns raw context from the videos - the agent will use this
-        context to generate the final answer.
+        This tool retrieves and returns raw context from the video transcript - the agent will use
+        this context to generate the final answer.
         
-        Use this when user asks about video content, topics, or specific details from videos.
+        Use this when user asks about video content, topics, or specific details from the video.
         Input should be the user's question about the video.
         
         Format example:
-        Action: youtube_rag_tool
+        Action: youtube_rag_tool_v2
         Action Input: "explain the main topic"
         
-        Do NOT use function call syntax like youtube_rag_tool("question").
+        Do NOT use function call syntax like youtube_rag_tool_v2("question").
         """
-        tool_db = SessionLocal()
-        try:
-            # Get session context
-            sess = tool_db.query(UserSession).filter(
-                UserSession.session_id == session_id_str
-            ).first()
-            
-            if not sess:
-                return "OBSERVATION: Session not found. Cannot retrieve video information."
-            
-            # Get shared index and namespace
-            index = get_shared_index()
-            namespace = get_user_namespace(username_str)
-            
-            # Build query with text input (Pinecone embeds automatically)
-            # AGENTS.md line 510-515: query structure for integrated embeddings
-            query_dict = {
-                "top_k": 12 * 2,  # More candidates for reranking (AGENTS.md line 511)
-                "inputs": {
-                    "text": question  # Text input (must match field_map: text=content)
-                }
+        # Build Pinecone search query with video_id filter
+        query_dict = {
+            "top_k": 20,
+            "inputs": {"text": query_text},
+            "filter": {"video_id": video_id}  # Filter to this video only
+        }
+        
+        # Search with reranking
+        results = index.search(
+            namespace=namespace,
+            query=query_dict,
+            rerank={
+                "model": "bge-reranker-v2-m3",
+                "top_n": 8,  # Optimized for performance while maintaining quality
+                "rank_fields": ["content"]
             }
-            
-            # Add filter if current_video_id exists
-            # AGENTS.md line 825-841: Dynamic filter pattern - only add if exists
-            if sess.current_video_id:
-                query_dict["filter"] = {"video_id": sess.current_video_id}
-                print(f"[youtube_rag_tool] Searching with video_id filter: {sess.current_video_id}")
-            else:
-                # CRITICAL: Don't set filter to None - omit the key entirely (AGENTS.md line 826)
-                print(f"[youtube_rag_tool] No current_video_id, searching across all user videos")
-            
-            # Search with reranking (AGENTS.md line 213-217, 516-520)
-            # AGENTS.md line 662-674: "always rerank in production"
-            try:
-                results = exponential_backoff_retry(
-                    lambda: index.search(
-                        namespace=namespace,
-                        query=query_dict,
-                        rerank={
-                            "model": "bge-reranker-v2-m3",  # AGENTS.md line 517, 214
-                            "top_n": 12,                    # Final number after reranking
-                            "rank_fields": ["content"]       # Field to rerank on (AGENTS.md line 519, 216)
-                        }
-                    )
-                )
-                
-                # Convert results to LangChain Document format
-                # CRITICAL: With reranking, use dict-style access (AGENTS.md line 221-230)
-                # AGENTS.md line 221: reranked_results['result']['hits']
-                # AGENTS.md line 225: "IMPORTANT: With reranking, use dict-style access"
-                raw_docs = []
-                for hit in results['result']['hits']:  # Dict access pattern
-                    doc = Document(
-                        page_content=hit['fields']['content'],  # Dict access (AGENTS.md line 222, 229)
-                        metadata={
-                            'video_id': hit['fields'].get('video_id'),  # Use .get() for optional (AGENTS.md line 230)
-                            'doc_id': hit['fields'].get('doc_id'),
-                            '_id': hit['_id'],              # Dict access (AGENTS.md line 227)
-                            '_score': hit['_score']         # Dict access (AGENTS.md line 228)
-                        }
-                    )
-                    raw_docs.append(doc)
-                
-                # Apply post-processing: score thresholding, diversity, context management
-                docs = process_retrieval_results(
-                    raw_docs,
-                    min_score=MIN_SIMILARITY_SCORE,
-                    max_per_video=MAX_CHUNKS_PER_VIDEO,
-                    max_context_length=MAX_CONTEXT_LENGTH
-                )
-            except Exception as e:
-                print(f"[ERROR] Search failed: {e}")
-                import traceback
-                traceback.print_exc()
-                docs = []
-            
-            if not docs:
-                if sess.current_video_id:
-                    return "OBSERVATION: No relevant information found in the current video for this question. The retrieved documents did not contain information related to the query. You should either: 1) Try rephrasing the question, 2) Use google_search_tool if the question is about current events, or 3) Provide a final answer explaining that the video does not contain relevant information."
-                else:
-                    return "OBSERVATION: No relevant information found in any processed videos for this question. The user's video index does not contain information related to the query. You should either: 1) Use google_search_tool if available to answer the question, or 2) Provide a final answer explaining that no relevant video content was found."
-            
-            # Format and return raw context (NOT a pre-generated answer)
-            # The agent will synthesize this context into a final answer
-            context = format_docs(docs, max_length=MAX_CONTEXT_LENGTH)
-            
-            # Add context about which video(s) the information came from
-            video_ids_found = set()
-            for doc in docs:
-                if hasattr(doc, 'metadata') and doc.metadata:
-                    vid_id = doc.metadata.get('video_id')
-                    if vid_id:
-                        video_ids_found.add(vid_id)
-            
-            # Determine if query is time-sensitive (check the original question)
-            time_sensitive_keywords = ["latest", "recent", "update", "new", "current", "2024", "2025", "now", "today"]
-            is_time_sensitive_query = any(keyword in question.lower() for keyword in time_sensitive_keywords)
-            
-            # Structure response with CRITICAL INSTRUCTION FIRST, then context
-            # Use full context - no truncation (MAX_CONTEXT_LENGTH already limits retrieval)
-            context_preview = context
-            
-            if video_ids_found:
-                if len(video_ids_found) == 1:
-                    vid_id = list(video_ids_found)[0]
-                    if is_time_sensitive_query:
-                        return f"""OBSERVATION: 
-🚨 NEXT ACTION REQUIRED 🚨
-This is a TIME-SENSITIVE query. Historical context found from video {vid_id}.
-→ NEXT STEP: Call google_search_tool NOW (do NOT call youtube_rag_tool again)
-
-Video context preview:
-{context_preview}"""
-                    else:
-                        return f"""OBSERVATION: 
-✅ FINAL ANSWER REQUIRED ✅
-Sufficient context found from video {vid_id} to answer this GENERAL question.
-→ NEXT STEP: Provide Final Answer NOW (do NOT call any more tools)
-
-Video context:
-{context_preview}"""
-                else:
-                    if is_time_sensitive_query:
-                        return f"""OBSERVATION: 
-🚨 NEXT ACTION REQUIRED 🚨
-This is a TIME-SENSITIVE query. Historical context found from {len(video_ids_found)} videos.
-→ NEXT STEP: Call google_search_tool NOW (do NOT call youtube_rag_tool again)
-
-Video context preview:
-{context_preview}"""
-                    else:
-                        return f"""OBSERVATION: 
-✅ FINAL ANSWER REQUIRED ✅
-Sufficient context found from {len(video_ids_found)} videos to answer this GENERAL question.
-→ NEXT STEP: Provide Final Answer NOW (do NOT call any more tools)
-
-Video context:
-{context_preview}"""
-            else:
-                if is_time_sensitive_query:
-                    return f"""OBSERVATION: 
-🚨 NEXT ACTION REQUIRED 🚨
-This is a TIME-SENSITIVE query. Historical context found.
-→ NEXT STEP: Call google_search_tool NOW (do NOT call youtube_rag_tool again)
-
-Video context preview:
-{context_preview}"""
-                else:
-                    return f"""OBSERVATION: 
-✅ FINAL ANSWER REQUIRED ✅
-Sufficient context found to answer this GENERAL question.
-→ NEXT STEP: Provide Final Answer NOW (do NOT call any more tools)
-
-Video context:
-{context_preview}"""
-            
-        except Exception as e:
-            return f"Error retrieving video information: {str(e)}"
-        finally:
-            tool_db.close()
-    
-    @tool
-    def google_search_tool(query_text: str) -> str:
-        """Performs a Google Custom Search and returns the top results.
+        )
         
-Use only when youtube_rag_tool cannot answer the question or for current events
-that are not covered in the video content.
-
-IMPORTANT: For time-sensitive queries (latest, recent, new, current updates):
-- This tool automatically updates the search query to use the current year
-- If the query contains an outdated year, it will be replaced with the current year
-- This ensures you get the most recent information available
-
-Format example:
-Action: google_search_tool
-Action Input: "latest news about Python asyncio"
-
-Do NOT use function call syntax like google_search_tool("query")."""
-        if not GOOGLE_SEARCH_API_KEY or not GOOGLE_SEARCH_ENGINE_ID:
-            # return "Google search is not configured. Please set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID."
-            raise ValueError("Google search is not configured. Please set GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID in the environment.")
+        # Process results (reuse existing post-processing logic)
+        docs = []
+        if results and 'result' in results and 'hits' in results['result']:
+            for hit in results['result']['hits']:
+                content = hit.get('fields', {}).get('content', '')
+                score = hit.get('_score', 0.0)
+                docs.append(Document(
+                    page_content=content,
+                    metadata={'_score': score, 'video_id': video_id}
+                ))
         
-        # Update query for time-sensitive searches: replace outdated years with current year
-        import re
-        updated_query = query_text
+        # Post-process (diversity, context length)
+        final_docs = process_retrieval_results(
+            docs,
+            min_score=MIN_SIMILARITY_SCORE,
+            max_per_video=MAX_CHUNKS_PER_VIDEO,
+            max_context_length=MAX_CONTEXT_LENGTH
+        )
         
-        # Detect if query is time-sensitive (contains latest, recent, new, current, updates)
-        time_sensitive_keywords = ["latest", "recent", "new", "current", "update", "updates"]
+        # Determine if query is time-sensitive
+        time_sensitive_keywords = ["latest", "recent", "update", "new", "current", "2024", "2025", "now", "today"]
         is_time_sensitive = any(keyword in query_text.lower() for keyword in time_sensitive_keywords)
         
+        if not final_docs:
+            return "OBSERVATION: No relevant information found in video transcript. Consider asking a more specific question or use google_search_tool_v2 if available."
+        
+        context = format_docs(final_docs)
+        
+        # Return structured response with plain text markers for agent guidance
         if is_time_sensitive:
-            # Replace any 4-digit years (1900-2099) that are not the current year with current year
-            year_pattern = r'\b(19|20)\d{2}\b'
-            updated_query = query_text
-            found_outdated_year = False
-            
-            # Find all years in the query
-            for year_match in re.finditer(year_pattern, query_text):
-                year = int(year_match.group())
-                if year < current_year:
-                    # Replace this specific outdated year with current year
-                    updated_query = updated_query.replace(year_match.group(), str(current_year), 1)
-                    found_outdated_year = True
-                    print(f"[google_search_tool] Updated query year from {year} to {current_year}: '{query_text}' -> '{updated_query}'")
-                    break  # Replace first outdated year found
-            
-            # If no outdated year found, add current year if query is about "latest" or "recent"
-            if not found_outdated_year:
-                if ("latest" in query_text.lower() or "recent" in query_text.lower() or "new" in query_text.lower()):
-                    if str(current_year) not in query_text:
-                        updated_query = f"{query_text} {current_year}"
-                        print(f"[google_search_tool] Added current year {current_year} to query: '{query_text}' -> '{updated_query}'")
+            return f"""OBSERVATION:
+NEXT_ACTION_REQUIRED
+TIME_SENSITIVE query. Historical context from video {video_id}.
+NEXT_STEP: Call google_search_tool_v2 NOW
+
+Video context:
+{context}"""
+        else:
+            return f"""OBSERVATION:
+FINAL_ANSWER_REQUIRED - STOP ALL TOOL CALLS NOW. Your next Thought MUST be "I now know the final answer" then provide Final Answer.
+Sufficient context from video {video_id}. DO NOT call any more tools.
+
+IMPORTANT: Your Final Answer should:
+- Synthesize comprehensively (not just summarize)
+- Use ALL relevant context provided
+- Include specific details, examples, and key points
+- Be thorough and detailed for complete understanding
+
+Video context:
+{context}"""
+    
+    return youtube_rag_tool_v2
+
+
+def create_google_search_tool_v2():
+    """
+    Factory function to create google_search_tool_v2 for web search.
+    
+    Uses GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID environment variables.
+    
+    Returns:
+        LangChain tool for Google web search
+    """
+    @tool
+    def google_search_tool_v2(query_text: str) -> str:
+        """
+        Performs a Google Custom Search and returns the top results.
         
+        Use only when youtube_rag_tool_v2 cannot answer the question or for current events
+        that are not covered in the video content.
+        
+        IMPORTANT: For time-sensitive queries (latest, recent, new, current updates):
+        - This tool should be called AFTER youtube_rag_tool_v2
+        - Combine video context with web results in your final answer
+        
+        Format example:
+        Action: google_search_tool_v2
+        Action Input: "latest news about Python asyncio"
+        
+        Do NOT use function call syntax like google_search_tool_v2("query").
+        """
+        # Use consistent environment variable names (matches top of file)
+        search_api_key = GOOGLE_SEARCH_API_KEY
+        search_engine_id = GOOGLE_SEARCH_ENGINE_ID
+        
+        if not search_api_key or not search_engine_id:
+            return "OBSERVATION: Web search is not configured. Please provide GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID."
+        
+        url = "https://www.googleapis.com/customsearch/v1"
         params = {
-            "key": GOOGLE_SEARCH_API_KEY,
-            "cx": GOOGLE_SEARCH_ENGINE_ID,
-            "q": updated_query,
+            "key": search_api_key,
+            "cx": search_engine_id,
+            "q": query_text,
+            "num": 5
         }
-
+        
         try:
-            response = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params=params,
-                timeout=10,
-            )
+            response = requests.get(url, params=params)
             response.raise_for_status()
-        except requests.RequestException as e:
-            return f"Google search request failed: {e}"
-
-        try:
-            payload = response.json()
-        except ValueError:
-            return "Google search returned an invalid response."
-
-        items = payload.get("items", [])
-        if not items:
-            return "Google search returned no results."
-
-        summaries = []
-        for item in items[:5]:
-            title = item.get("title", "Untitled result")
-            snippet = item.get("snippet", "")
-            link = item.get("link", "")
-            summaries.append(f"Title: {title}\nSnippet: {snippet}\nLink: {link}")
-
-        # Join summaries outside f-string to avoid backslash in expression
-        search_results = "\n\n".join(summaries)
-        
-        return f"""OBSERVATION: 
-✅ FINAL ANSWER REQUIRED ✅
-You have received web search results for current/recent information.
-→ NEXT STEP: Provide Final Answer NOW by synthesizing:
-  1. The video context from youtube_rag_tool (already retrieved)
-  2. The web search results below
-DO NOT call any more tools - you have all the information needed.
-
-=== WEB SEARCH RESULTS ===
-{search_results}"""
-    
-    # ========================================
-    # STEP 5: Create and Execute Agent
-    # ========================================
-    
-    # Custom error handler for tool parsing errors
-    def handle_tool_parsing_error(error: str, tools: list) -> str:
-        """
-        Detects malformed tool calls and reformats them to proper ReAct format.
-        Handles patterns like tool_name("input") or tool_name('input')
-        """
-        import re
-        
-        # Pattern to match function call syntax: tool_name("input") or tool_name('input')
-        pattern = r'(\w+)\s*\(["\']([^"\']+)["\']\)'
-        match = re.search(pattern, error)
-        
-        if match:
-            tool_name = match.group(1)
-            tool_input = match.group(2)
+            results = response.json()
             
-            # Check if tool_name is a valid tool
-            tool_names = [tool.name for tool in tools]
-            if tool_name in tool_names:
-                # Return corrected format
-                return f"I need to use the {tool_name} tool. Action: {tool_name}\nAction Input: {tool_input}"
+            if "items" not in results:
+                return "OBSERVATION: No web search results found."
+            
+            docs = []
+            for item in results["items"][:5]:
+                title = item.get("title", "")
+                snippet = item.get("snippet", "")
+                link = item.get("link", "")
+                docs.append(Document(
+                    page_content=f"{title}\n{snippet}",
+                    metadata={"source": link}
+                ))
+            
+            context = format_docs(docs)
+            
+            # Return structured response with plain text markers
+            return f"""OBSERVATION:
+FINAL_ANSWER_REQUIRED - STOP ALL TOOL CALLS NOW. Your next Thought MUST be "I now know the final answer" then provide Final Answer.
+Web search results received. Synthesize video context + web results. DO NOT call any more tools.
+
+IMPORTANT: Your Final Answer should:
+- Synthesize comprehensively from BOTH video context AND web search results
+- Use ALL relevant information from both sources
+- Include specific details, examples, and key points
+- Be thorough and detailed for complete understanding
+
+WEB_SEARCH_RESULTS:
+{context}"""
         
-        # If no pattern matched, return original error message
-        return f"Invalid tool format. Please use:\nAction: tool_name\nAction Input: your_input\n\nError: {error}"
+        except Exception as e:
+            return f"OBSERVATION: Web search failed: {str(e)}"
     
-    # Pre-execution validation: Check tool availability and video context
-    tools_list = [youtube_rag_tool]  # Always include RAG tool
+    return google_search_tool_v2
+
+
+def create_youtube_rag_tool_general(index, namespace: str):
+    """
+    Factory function to create youtube_rag_tool_general for general (cross-video) conversations.
     
-    # Only add Google search tool if configured
-    if GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID:
-        tools_list.append(google_search_tool)
-    else:
-        print("[INFO] Google search tool not available (not configured)")
+    Args:
+        index: Pinecone index instance
+        namespace: User namespace for data isolation
     
-    # Validate video context exists
-    if not current_vid and not session.current_video_id:
-        print("[WARN] No video context available for this session")
-    
-    # Create agent with request-specific tools (use cached prompt)
-    agent = create_react_agent(
-        llm=model,
-        tools=tools_list,
-        prompt=REACT_AGENT_PROMPT  # Use cached prompt from module level
-    )
-    
-    # Create error handler wrapper
-    def parsing_error_handler(error: str) -> str:
-        return handle_tool_parsing_error(error, tools_list)
-    
-    # Custom callback to track tool execution and detect looping
-    class ToolTrackingCallback(BaseCallbackHandler):
-        """Callback that tracks tool calls to detect looping"""
-        def __init__(self):
-            super().__init__()
-            self.tool_calls = []
-            self.tool_results = []
+    Returns:
+        LangChain tool for general RAG search with catalog shortlisting
+    """
+    @tool
+    def youtube_rag_tool_general(query_text: str) -> str:
+        """
+        PRIORITY TOOL: Use this FIRST for any question about video content.
         
-        def on_tool_end(self, output: str, **kwargs) -> None:
-            """Called when a tool finishes execution"""
-            tool_name = kwargs.get('name', 'unknown')
-            self.tool_calls.append(tool_name)
-            if isinstance(output, str):
-                self.tool_results.append(output)
-                # Log tool execution
-                if "youtube_rag_tool" in tool_name:
-                    if "Found relevant context" in output:
-                        print(f"[CALLBACK] youtube_rag_tool returned context - agent should analyze and decide next step")
-                    elif "No relevant information" in output:
-                        print(f"[CALLBACK] youtube_rag_tool found no context - agent should try google_search_tool or provide final answer")
+        Returns relevant context from YouTube videos for the agent to synthesize into an answer.
+        This tool searches across ALL videos processed by the user (including videos from previous
+        conversations). It uses catalog-based shortlisting to find the most relevant videos first,
+        then retrieves context from those videos.
+        
+        This tool retrieves and returns raw context from multiple videos - the agent will use this
+        context to generate the final answer.
+        
+        Use this when user asks about video content, topics, or specific details from their videos.
+        Input should be the user's question about the videos.
+        
+        Format example:
+        Action: youtube_rag_tool_general
+        Action Input: "explain machine learning concepts"
+        
+        Do NOT use function call syntax like youtube_rag_tool_general("question").
+        """
+        # Use General tab retrieval with catalog shortlisting
+        docs, shortlisted_video_ids = retrieve_for_general_tab(
+            chunks_index=index,
+            namespace=namespace,
+            query=query_text
+        )
+        
+        # Determine if query is time-sensitive
+        time_sensitive_keywords = ["latest", "recent", "update", "new", "current", "2024", "2025", "now", "today"]
+        is_time_sensitive = any(keyword in query_text.lower() for keyword in time_sensitive_keywords)
+        
+        if not docs:
+            return "OBSERVATION: No relevant information found in processed videos. Consider using google_search_tool_v2 if this is a current events question."
+        
+        context = format_docs(docs)
+        
+        # Get citations for response (create new session to avoid stale session issues)
+        citations = format_citations_from_docs(docs, lambda: SessionLocal())
+        citation_text = ""
+        if citations:
+            citation_text = "\n\nSources:\n"
+            for vid_id, info in citations.items():
+                citation_text += f"- {info['title']}: {info['url']}\n"
+        
+        # Return structured response with citations
+        if is_time_sensitive:
+            return f"""OBSERVATION:
+NEXT_ACTION_REQUIRED
+TIME_SENSITIVE query. Historical context from {len(shortlisted_video_ids)} videos.
+NEXT_STEP: Call google_search_tool_v2 NOW
+
+Video context:
+{context}
+{citation_text}"""
+        else:
+            return f"""OBSERVATION:
+FINAL_ANSWER_REQUIRED - STOP ALL TOOL CALLS NOW. Your next Thought MUST be "I now know the final answer" then provide Final Answer.
+Sufficient context from {len(shortlisted_video_ids)} videos. DO NOT call any more tools.
+
+IMPORTANT: Your Final Answer should:
+- Synthesize comprehensively (not just summarize)
+- Use ALL relevant context from all videos provided
+- Include specific details, examples, and key points
+- Be thorough and detailed for complete understanding
+
+Video context:
+{context}
+{citation_text}"""
     
-    tool_tracking_callback = ToolTrackingCallback()
+    return youtube_rag_tool_general
+
+
+# ============================================================================
+# SCHEMA 2 ENDPOINTS - Video-Scoped Conversations
+# ============================================================================
+
+@app.post("/api/v2/chat/video", response_model=ConversationResponse)
+async def chat_with_video_v2(
+    user_input: ConversationInput,
+    current_user: dict = Depends(require_scope("write")),
+    db: Session = Depends(get_db)
+):
+    """
+    Chat with a specific YouTube video using Schema 2 (video-scoped conversations).
     
-    agent_executor = AgentExecutor(
-        agent=agent,
-        tools=tools_list,
-        handle_parsing_errors=parsing_error_handler,
-        verbose=True,  # Disable verbose to avoid callback errors
-        max_iterations=5,  # Allow: 1 for youtube_rag, 1 for google_search (if needed), 1 for final answer + buffer for looping
-        return_intermediate_steps=True,  # Enable to detect tool failures
-        callbacks=[tool_tracking_callback]  # Track tool calls
-    )
+    This endpoint:
+    1. Creates or retrieves conversation for (user, video)
+    2. Embeds video if not already embedded
+    3. Runs RAG query filtered to this video
+    4. Stores user message and assistant reply
+    5. Updates conversation metadata
     
-    # Build agent input with context and history
-    context_parts = []
-    
-    # Add instructions based on video context availability
-    if current_vid or session.current_video_id:
-        context_parts.append("=" * 60)
-        context_parts.append("IMPORTANT: VIDEO CONTEXT IS AVAILABLE")
-        context_parts.append("=" * 60)
-        context_parts.append("ALWAYS use youtube_rag_tool FIRST for any question about video content.")
-        context_parts.append("Do NOT use your general knowledge if video context is available.")
-        context_parts.append("Only use google_search_tool if youtube_rag_tool cannot answer or for current events.")
-        context_parts.append("=" * 60)
-        context_parts.append("")
-    else:
-        # No video context in current session - but videos may exist from previous sessions
-        context_parts.append("=" * 60)
-        context_parts.append("NOTE: NO CURRENT VIDEO IN THIS SESSION")
-        context_parts.append("=" * 60)
-        context_parts.append("No video has been processed in this session yet.")
-        context_parts.append("However, youtube_rag_tool will search across ALL videos processed by this user")
-        context_parts.append("(including videos from previous sessions).")
-        context_parts.append("You should still try youtube_rag_tool first - it may find relevant content from previous sessions.")
-        context_parts.append("If youtube_rag_tool returns 'No relevant information found', then:")
-        context_parts.append("1) Use google_search_tool if available to answer the question, OR")
-        context_parts.append("2) Provide a final answer explaining that no relevant video content was found.")
-        context_parts.append("=" * 60)
-        context_parts.append("")
-    
-    # Add conversation history if exists
-    if history:
-        context_parts.append("Previous conversation:")
-        for msg in history[-6:]:  # Last 3 exchanges
-            msg_type = "Human" if isinstance(msg, HumanMessage) else "AI"
-            # Don't truncate - agent needs full context to understand references
-            content = msg.content  # Full content for proper context
-            context_parts.append(f"{msg_type}: {content}")
-        context_parts.append("")  # Empty line
-    
-    # Add video context
-    if current_vid:
-        context_parts.append(f"[Just processed YouTube video ID: {current_vid}]")
-    elif session.current_video_id:
-        context_parts.append(f"[Previously discussed video: {session.current_video_id}]")
-    
-    # Get current date/time for time-sensitive queries (same as in tool closure)
-    current_time = datetime.utcnow()
-    current_year = current_time.year
-    current_date_str = current_time.strftime("%Y-%m-%d")
-    
-    # Add intent analysis hint to help agent understand query type
-    time_sensitive_keywords = ["latest", "recent", "update", "new", "current", "2024", "2025", "now", "today"]
-    is_time_sensitive = any(keyword in query.lower() for keyword in time_sensitive_keywords)
-    
-    if is_time_sensitive:
-        context_parts.append("")
-        context_parts.append("QUERY TYPE: TIME-SENSITIVE")
-        context_parts.append("This question asks about recent/latest information.")
-        context_parts.append(f"CURRENT DATE: {current_date_str} (Year: {current_year})")
-        context_parts.append("CRITICAL: When calling google_search_tool, use the CURRENT YEAR in your search query.")
-        context_parts.append(f"Example: If user asks about 'Python updates 2023', search for 'Python updates {current_year}' or 'latest Python updates {current_year}'")
-        context_parts.append("Strategy: 1) Use youtube_rag_tool first, 2) Then use google_search_tool for current info, 3) Combine both in final answer.")
-    else:
-        context_parts.append("")
-        context_parts.append("QUERY TYPE: GENERAL KNOWLEDGE")
-        context_parts.append("This is a general question about a topic.")
-        context_parts.append("Strategy: Use youtube_rag_tool ONCE. If it returns context, IMMEDIATELY provide final answer. DO NOT call it again.")
-    
-    context_parts.append(f"\nCurrent question: {query}")
-    agent_input = "\n".join(context_parts)
-    
-    # Execute agent - agent should analyze tool results and decide next steps
+    Replaces legacy / endpoint (session-based) with video-first approach.
+    Requires 'write' scope.
+    """
     try:
-        result = agent_executor.invoke({"input": agent_input})
-        answer = result["output"]
-        intermediate_steps = result.get("intermediate_steps", [])
+        # Check if Pinecone client is initialized
+        if pc is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Pinecone service is not available. Please configure PINECONE_API_KEY in .env file."
+            )
         
-        # Check for looping behavior (agent calling same tool multiple times)
-        youtube_rag_calls = sum(1 for step in intermediate_steps if len(step) >= 2 and "youtube_rag_tool" in str(step[0]))
-        if youtube_rag_calls > 1:
-            print(f"[WARN] Agent called youtube_rag_tool {youtube_rag_calls} times - this indicates looping behavior")
-            # Extract context from first call and check instruction
-            for i, step in enumerate(intermediate_steps):
-                if len(step) >= 2:
-                    tool_result = step[1]
-                    if isinstance(tool_result, str) and "OBSERVATION:" in tool_result:
-                        # Check for new structured format with emojis
-                        if "✅ FINAL ANSWER REQUIRED ✅" in tool_result:
-                            # General question - extract context and synthesize
-                            if "Video context:" in tool_result:
-                                found_context = tool_result.split("Video context:", 1)[1].strip()
-                                print(f"[FIX] Agent looped but should have stopped. Synthesizing from first tool result.")
-                                synthesis_chain = RunnableParallel({
-                                    'question': RunnablePassthrough(),
-                                    'context': RunnableLambda(lambda x: found_context)
-                                }) | prompt | model | parser
-                                answer = synthesis_chain.invoke(query)
-                                intermediate_steps = intermediate_steps[:i+1]
-                                break
-                        elif "🚨 NEXT ACTION REQUIRED 🚨" in tool_result:
-                            # Time-sensitive - should call google_search_tool
-                            if "Video context preview:" in tool_result:
-                                found_context = tool_result.split("Video context preview:", 1)[1].strip()
-                                print(f"[FIX] Agent looped but should have called google_search_tool. Checking if google_search was called...")
-                                # Check if google_search_tool was called after this
-                                google_called = any(
-                                    "google_search_tool" in str(step[0]) 
-                                    for step in intermediate_steps[i+1:] 
-                                    if len(step) >= 2
-                                )
-                                if not google_called:
-                                    print(f"[FIX] google_search_tool was not called. This is a time-sensitive query - agent should have called it.")
-                                    # For now, synthesize from video context only (fallback)
-                                    synthesis_chain = RunnableParallel({
-                                        'question': RunnablePassthrough(),
-                                        'context': RunnableLambda(lambda x: found_context)
-                                    }) | prompt | model | parser
-                                    answer = synthesis_chain.invoke(query)
-                                    intermediate_steps = intermediate_steps[:i+1]
-                                    break
+        # STEP 1: Get current user
+        user = db.query(User).filter(User.username == current_user["username"]).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
         
-        # Additional check: If agent hit iteration limit, synthesize from available context
-        if "Agent stopped" in answer or not answer:
-            print(f"[FALLBACK] Agent hit iteration limit or didn't provide answer. Synthesizing from tool results...")
-            # Collect all context from tool results
-            all_contexts = []
-            google_search_result = None
-            
-            for step in intermediate_steps:
-                if len(step) >= 2:
-                    tool_result = step[1]
-                    if isinstance(tool_result, str):
-                        # Extract video context from new format
-                        if "Video context" in tool_result or "Video context preview" in tool_result:
-                            # Extract context after "Video context" or "Video context preview"
-                            if "Video context preview:" in tool_result:
-                                ctx = tool_result.split("Video context preview:", 1)[1].strip()
-                            elif "Video context:" in tool_result:
-                                ctx = tool_result.split("Video context:", 1)[1].strip()
-                            else:
-                                ctx = None
-                            if ctx:
-                                all_contexts.append(ctx)
-                        # Extract google search results
-                        if "Title:" in tool_result and "Snippet:" in tool_result:
-                            google_search_result = tool_result
-            
-            # Synthesize answer from collected contexts
-            if all_contexts or google_search_result:
-                combined_context = "\n\n".join(all_contexts)
-                if google_search_result:
-                    combined_context += f"\n\n=== Web Search Results ===\n{google_search_result}"
-                
-                print(f"[FALLBACK] Synthesizing answer from {len(all_contexts)} video context(s) and web search results")
-                synthesis_chain = RunnableParallel({
-                    'question': RunnablePassthrough(),
-                    'context': RunnableLambda(lambda x: combined_context)
-                }) | prompt | model | parser
-                answer = synthesis_chain.invoke(query)
-                print(f"[FALLBACK] Successfully synthesized answer from tool results")
+        # STEP 2: Resolve video_id and validate input
+        import uuid as uuid_lib
         
-        # Monitor agent execution: Track tool usage patterns
-        tools_used = []
-        tool_results = []
-        tool_calls_with_inputs = []  # Track tool calls with their inputs
-        
-        for step in intermediate_steps:
-            if len(step) >= 2:
-                tool_action = step[0]
-                tool_result = step[1]
-                
-                # Extract tool name and input from action
-                tool_name = str(tool_action) if tool_action else "unknown"
-                tool_input = ""
-                if hasattr(tool_action, 'tool_input'):
-                    tool_input = str(tool_action.tool_input)
-                elif isinstance(tool_action, dict):
-                    tool_input = str(tool_action.get('tool_input', ''))
-                
-                tools_used.append(tool_name)
-                tool_results.append(tool_result)
-                tool_calls_with_inputs.append((tool_name, tool_input))
-        
-        # Detect repeated tool calls with same input (indicates looping)
-        if len(tool_calls_with_inputs) > 1:
-            seen_calls = {}
-            for tool_name, tool_input in tool_calls_with_inputs:
-                key = f"{tool_name}:{tool_input}"
-                if key in seen_calls:
-                    seen_calls[key] += 1
-                else:
-                    seen_calls[key] = 1
-            
-            repeated_calls = {k: v for k, v in seen_calls.items() if v > 1}
-            if repeated_calls:
-                print(f"[MONITOR] WARNING: Repeated tool calls detected: {repeated_calls}")
-                print(f"[MONITOR] Agent may be looping - consider this in failure detection")
-        
-        # Log tool usage
-        if tools_used:
-            unique_tools = list(set(tools_used))
-            print(f"[MONITOR] Tools executed: {', '.join(unique_tools)}")
-            print(f"[MONITOR] Total tool calls: {len(tools_used)}")
-            
-            # Log tool results summary
-            for i, (tool_name, tool_result) in enumerate(zip(tools_used, tool_results)):
-                if isinstance(tool_result, str):
-                    result_preview = tool_result[:200] + "..." if len(tool_result) > 200 else tool_result
-                    print(f"[MONITOR] Tool call {i+1} ({tool_name}): Result preview: {result_preview}")
-                    if "No video context" in tool_result or "OBSERVATION: No video context" in tool_result:
-                        print(f"[MONITOR] Tool call {i+1} ({tool_name}): Returned 'No video context' - agent should stop retrying")
-                    elif "Relevant context" in tool_result:
-                        print(f"[MONITOR] Tool call {i+1} ({tool_name}): Returned relevant context - agent should synthesize and provide final answer")
-        else:
-            print("[MONITOR] No tools were executed - agent may have used general knowledge")
-            if current_vid or session.current_video_id:
-                print("[MONITOR] WARNING: Video context exists but no tools were used!")
-        
-        # Check for various failure scenarios
-        should_fallback = False
-        failure_reason = None
-        
-        # Check 1: Agent stopped due to iteration limit or parsing errors
-        if "Agent stopped" in answer or "Invalid Format" in answer or "not a valid tool" in answer:
-            should_fallback = True
-            failure_reason = "Agent stopped or parsing error"
-        
-        # Check 2: Agent looping on tool responses (both success and failure cases)
-        no_video_context_count = 0
-        context_found_count = 0
-        if intermediate_steps:
-            for step in intermediate_steps:
-                if len(step) >= 2:
-                    tool_result = step[1]
-                    if isinstance(tool_result, str):
-                        if "No video context" in tool_result or "OBSERVATION: No video context" in tool_result:
-                            no_video_context_count += 1
-                        elif "OBSERVATION: Found relevant context" in tool_result or "Relevant context" in tool_result:
-                            context_found_count += 1
-            
-            # If agent called youtube_rag_tool multiple times with "No video context" response
-            if no_video_context_count > 1:
-                should_fallback = True
-                failure_reason = f"Agent looping on 'No video context' ({no_video_context_count} times)"
-                print(f"[FALLBACK] Detected looping: Agent called youtube_rag_tool {no_video_context_count} times despite 'No video context' response")
-            
-            # If agent got context but still called the tool again (looping on success)
-            if context_found_count > 0 and len([s for s in intermediate_steps if len(s) >= 2 and "youtube_rag_tool" in str(s[0])]) > context_found_count:
-                should_fallback = True
-                failure_reason = f"Agent looping after receiving context ({context_found_count} context(s) found but {len([s for s in intermediate_steps if len(s) >= 2 and 'youtube_rag_tool' in str(s[0])])} tool calls)"
-                print(f"[FALLBACK] Detected looping: Agent received context but continued calling youtube_rag_tool")
-        
-        # Check 3: Tool execution failures (tools were called but returned errors)
-        if intermediate_steps:
-            tool_failures = 0
-            successful_tools = 0
-            for step in intermediate_steps:
-                if len(step) >= 2:
-                    tool_result = step[1]
-                    # Check if tool result indicates failure
-                    if isinstance(tool_result, str):
-                        if "Error" in tool_result or "failed" in tool_result.lower() or "not configured" in tool_result.lower():
-                            tool_failures += 1
-                        elif "No video context" not in tool_result and "OBSERVATION: No video context" not in tool_result:
-                            # Don't count "No video context" as a failure if it's the first call
-                            successful_tools += 1
-            
-            # If all tools failed or no tools succeeded (excluding first "No video context" call)
-            if tool_failures > 0 and successful_tools == 0 and no_video_context_count <= 1:
-                should_fallback = True
-                failure_reason = f"All tools failed ({tool_failures} failures)"
-        else:
-            # Check 4: No tools were executed at all (agent answered without using tools)
-            if current_vid or session.current_video_id:
-                # If video context exists but no tools were used, agent likely used knowledge
-                if not any("youtube_rag_tool" in str(step) for step in intermediate_steps):
-                    should_fallback = True
-                    failure_reason = "No tools executed despite video context"
-        
-        # Execute fallback RAG if needed
-        if should_fallback and (current_vid or session.current_video_id):
+        if user_input.conversation_id:
+            # Phase 5.13: Resume existing conversation with validation
             try:
-                print(f"[FALLBACK] Agent failed ({failure_reason}), using direct RAG for query: {query}")
-                index = get_shared_index()
-                namespace = get_user_namespace(user.username)
+                # Debug logging (Phase 1.3): Log conversation retrieval
+                conv_uuid = uuid_lib.UUID(user_input.conversation_id)
+                if DEBUG_LOGGING:
+                    log_data = {
+                        "event": "conversation_retrieval",
+                        "conversation_id": str(conv_uuid),
+                        "user_id": str(user.id),
+                        "username": user.username,
+                        "endpoint": "/api/v2/chat/video",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    logger.debug(f"[CHAT] Retrieving conversation: {json.dumps(log_data)}")
                 
-                # Build query dict (AGENTS.md line 855-862: Dynamic filter pattern)
-                query_dict = {
-                    "top_k": 10 * 2,  # More candidates for reranking (AGENTS.md line 511)
-                    "inputs": {"text": query}  # Text input (AGENTS.md line 512-513)
-                }
+                # Phase 5.13: Use utility function for ownership verification
+                is_owner, error_msg = verify_conversation_ownership(db, conv_uuid, user.id)
                 
-                # Only add filter if it exists (AGENTS.md line 859-860)
-                if current_vid or session.current_video_id:
-                    query_dict["filter"] = {"video_id": current_vid or session.current_video_id}
-                # Don't set filter to None - omit key entirely if no filter
-                
-                # Search with reranking (AGENTS.md line 508-522)
-                results = exponential_backoff_retry(
-                    lambda: index.search(
-                        namespace=namespace,
-                        query=query_dict,
-                        rerank={
-                            "model": "bge-reranker-v2-m3",  # AGENTS.md line 517
-                            "top_n": 10,                    # Final results after reranking
-                            "rank_fields": ["content"]      # AGENTS.md line 519
-                        }
+                if not is_owner:
+                    # Phase 3.13: Enhanced error message for invalid conversation_id
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"Conversation {user_input.conversation_id} not found or you don't have access. "
+                               f"Please verify the conversation ID or start a new conversation."
                     )
+                
+                # Get conversation details
+                retrieval_start = time.time()
+                conversation = get_conversation_by_id(
+                    db, 
+                    conv_uuid, 
+                    user_id=user.id
                 )
+                retrieval_time = (time.time() - retrieval_start) * 1000
                 
-                # Parse results with dict-style access (AGENTS.md line 221-230)
-                raw_docs = [Document(
-                    page_content=hit['fields']['content'],  # Dict access (AGENTS.md line 222)
-                    metadata={
-                        'video_id': hit['fields'].get('video_id'),  # Use .get() for optional (AGENTS.md line 230)
-                        'doc_id': hit['fields'].get('doc_id'),
-                        '_id': hit['_id'],
-                        '_score': hit['_score']
-                    })
-                    for hit in results['result']['hits']]  # Dict access (AGENTS.md line 221)
+                if DEBUG_LOGGING:
+                    log_data["conversation_found"] = conversation is not None
+                    log_data["retrieval_time_ms"] = round(retrieval_time, 2)
+                    if conversation:
+                        log_data["video_id"] = conversation.video_id
+                        log_data["video_title"] = conversation.video_title[:100]
+                    logger.debug(f"[CHAT] Conversation retrieval result: {json.dumps(log_data)}")
                 
-                # Apply post-processing: score thresholding, diversity, context management
-                docs = process_retrieval_results(
-                    raw_docs,
-                    min_score=MIN_SIMILARITY_SCORE,
-                    max_per_video=MAX_CHUNKS_PER_VIDEO,
-                    max_context_length=MAX_CONTEXT_LENGTH
-                )
+                if not conversation:
+                    # This should not happen if ownership check passed, but defensive check
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"Conversation {user_input.conversation_id} not found. "
+                               f"Please verify the conversation ID or start a new conversation."
+                    )
+                video_id = conversation.video_id
+                video_url = conversation.video_url
+                video_title = conversation.video_title
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid conversation_id format")
+        elif user_input.video_url or user_input.video_id:
+            # Start new conversation with video
+            if user_input.video_url:
+                video_id = get_youtube_video_id(str(user_input.video_url))
+            else:
+                video_id = user_input.video_id
+            
+            if not video_id:
+                raise HTTPException(status_code=400, detail="Invalid video URL or ID")
+            
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            video_title = "YouTube Video"  # Will be updated after embedding
+            
+            # Create or get conversation
+            conversation = get_or_create_conversation(
+                db=db,
+                user_id=user.id,
+                video_id=video_id,
+                video_url=video_url,
+                video_title=video_title
+            )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Must provide video_url, video_id, or conversation_id"
+            )
+        
+        # Validate and sanitize query input
+        user_input.query = user_input.query.strip()
+        if not user_input.query:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        if len(user_input.query) > MAX_QUERY_LENGTH:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Query too long. Maximum {MAX_QUERY_LENGTH} characters allowed."
+            )
+        
+        # STEP 3: Embed video (if not already embedded)
+        index = get_shared_index()
+        namespace = get_user_namespace(user.username)
+        
+        # Use extracted embedding function (also creates catalog entry)
+        video_id, video_title = embed_video_if_needed(
+            db=db,
+            video_id=video_id,
+            video_url=video_url,
+            user_id=user.id,
+            index=index,
+            namespace=namespace
+        )
+        
+        # Title will be updated after successful message insertion (see below)
+        
+        # STEP 4: Build agent context from conversation history
+        recent_messages = get_recent_messages_for_context(
+            db, conversation.conversation_id, limit=10
+        )
+        
+        # Convert to LangChain message format
+        history = []
+        for msg in recent_messages:
+            if msg.role == 'user':
+                history.append(HumanMessage(content=msg.content))
+            elif msg.role == 'assistant':
+                history.append(AIMessage(content=msg.content))
+        
+        # STEP 5: Create agent tools using factory functions
+        youtube_rag_tool_v2 = create_youtube_rag_tool_v2(index, namespace, video_id)
+        google_search_tool_v2 = create_google_search_tool_v2()
+        
+        # Verify tools are properly structured (debugging aid)
+        tools = [youtube_rag_tool_v2, google_search_tool_v2]
+        print(f"[DEBUG] Created {len(tools)} tools: {[tool.name if hasattr(tool, 'name') else type(tool).__name__ for tool in tools]}")
+        
+        # Create callback to track tool execution and detect looping
+        class ToolTrackingCallback(BaseCallbackHandler):
+            """Callback that tracks tool calls to detect looping"""
+            def __init__(self):
+                super().__init__()
+                self.tool_calls = []
+                self.tool_results = []
+            
+            def on_tool_end(self, output: str, **kwargs) -> None:
+                """Called when a tool finishes execution"""
+                tool_name = kwargs.get('name', 'unknown')
+                self.tool_calls.append(tool_name)
+                if isinstance(output, str):
+                    self.tool_results.append(output)
+                    # Log tool execution for monitoring
+                    if "youtube_rag_tool_v2" in tool_name:
+                        if "FINAL_ANSWER_REQUIRED" in output:
+                            print(f"[CALLBACK] youtube_rag_tool_v2 returned context - agent should provide final answer")
+                        elif "NEXT_ACTION_REQUIRED" in output:
+                            print(f"[CALLBACK] youtube_rag_tool_v2 detected time-sensitive query - agent should call google_search_tool_v2")
+                    elif "google_search_tool_v2" in tool_name:
+                        print(f"[CALLBACK] google_search_tool_v2 executed - agent should provide final answer")
+        
+        tool_tracking_callback = ToolTrackingCallback()
+        
+        # Create agent executor with enhanced prompt and callbacks
+        # Use cached REACT_AGENT_PROMPT which includes tool instructions
+        agent = create_react_agent(model, tools, REACT_AGENT_PROMPT)
+        agent_executor = AgentExecutor(
+            agent=agent, 
+            tools=tools, 
+            verbose=True, 
+            max_iterations=5,  # Increased to allow proper answer synthesis from large contexts
+            handle_parsing_errors=True,
+            callbacks=[tool_tracking_callback]  # Add callback for monitoring
+        )
+        
+        # Invoke agent with timeout protection
+        import asyncio
+        import time
+        
+        start_time = time.time()
+        timeout_seconds = 60.0  # 60 second timeout
+        
+        try:
+            # Run agent with timeout
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    agent_executor.invoke,
+                    {
+                        "input": user_input.query,
+                        "chat_history": history
+                    }
+                ),
+                timeout=timeout_seconds
+            )
+            
+            execution_time = time.time() - start_time
+            print(f"[TIMING] Agent execution completed in {execution_time:.2f} seconds")
+            
+            answer = result.get("output", "I couldn't generate an answer.")
+            
+            # Detect looping behavior by analyzing tool calls
+            if len(tool_tracking_callback.tool_calls) > 0:
+                # Count occurrences of each tool
+                tool_count = {}
+                for tool_name in tool_tracking_callback.tool_calls:
+                    tool_count[tool_name] = tool_count.get(tool_name, 0) + 1
                 
-                if docs:
-                    context = format_docs(docs, max_length=MAX_CONTEXT_LENGTH)
-                    # Build fallback chain
-                    fallback_chain = RunnableParallel({
-                        'question': RunnablePassthrough(),
-                        'context': RunnableLambda(lambda x: context)
-                    }) | prompt | model | parser
-                    answer = fallback_chain.invoke(query)
-                    print(f"[FALLBACK] Successfully retrieved {len(docs)} documents and generated answer")
+                # Check for excessive calls to same tool
+                for tool_name, count in tool_count.items():
+                    if count > 2:
+                        print(f"[WARNING] Detected potential looping: {tool_name} called {count} times")
+                        print(f"[WARNING] Tool call sequence: {' -> '.join(tool_tracking_callback.tool_calls)}")
+                
+                # Log tool usage summary
+                print(f"[MONITOR] Tools used: {', '.join(set(tool_tracking_callback.tool_calls))}")
+                print(f"[MONITOR] Total tool calls: {len(tool_tracking_callback.tool_calls)}")
+        
+        except asyncio.TimeoutError:
+            execution_time = time.time() - start_time
+            print(f"[ERROR] Agent execution timed out after {execution_time:.2f} seconds")
+            print(f"[ERROR] Query that timed out: {user_input.query[:100]}...")  # Log partial query for debugging
+            raise HTTPException(
+                status_code=504,
+                detail=f"Agent execution timed out after {timeout_seconds} seconds. Please try a simpler query or contact support."
+            )
+        
+        # STEP 7: Store conversation turn in database
+        user_msg, assistant_msg = insert_conversation_turn(
+            db=db,
+            conversation_id=conversation.conversation_id,
+            user_id=user.id,
+            video_id=video_id,
+            user_message=user_input.query,
+            assistant_message=answer
+        )
+        
+        # STEP 8: Update conversation title if it was generic (after successful message insertion)
+        # This is deferred until after successful insert to maintain transaction consistency
+        if conversation.video_title == "YouTube Video" and video_title != "YouTube Video":
+            try:
+                conversation.video_title = video_title
+                db.commit()
+                db.refresh(conversation)
+                print(f"[INFO] Updated conversation title to: {video_title}")
             except Exception as e:
-                print(f"[FALLBACK] Error in fallback RAG: {e}")
-                pass  # Use agent's answer even if fallback fails
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Agent execution error: {str(e)}"
+                print(f"[WARN] Failed to update conversation title: {e}")
+                db.rollback()
+                # Continue - title update is non-critical, main transaction already succeeded
+        
+        # STEP 9: Return response
+        return ConversationResponse(
+            conversation_id=str(conversation.conversation_id),
+            video_id=video_id,
+            video_title=conversation.video_title,
+            user_message=user_input.query,
+            assistant_message=answer,
+            message_index=assistant_msg.message_index,
+            created_at=assistant_msg.created_at.isoformat()
         )
     
-    # ========================================
-    # STEP 6: Store Conversation in DB
-    # ========================================
-    
-    # Get next message index
-    last_msg = db.query(Message).filter(
-        Message.session_id == session.session_id
-    ).order_by(Message.message_index.desc()).first()
-    
-    next_index = (last_msg.message_index + 1) if last_msg else 0
-    
-    # Store user message
-    user_msg = Message(
-        session_id=session.session_id,
-        message_index=next_index,
-        message_type='human',
-        content=query,
-        video_id=current_vid
-    )
-    db.add(user_msg)
-    
-    # Store AI response
-    ai_msg = Message(
-        session_id=session.session_id,
-        message_index=next_index + 1,
-        message_type='ai',
-        content=answer,
-        video_id=current_vid
-    )
-    db.add(ai_msg)
-    
-    # Commit all changes (trigger will auto-cleanup old messages)
-    db.commit()
-    
-    print(f"[INFO] Stored conversation (messages {next_index}-{next_index+1})")
-    
-    # ========================================
-    # STEP 7: Return Response
-    # ========================================
-    
-    return {
-        "answer": answer,
-        "session_id": str(session.session_id),
-        "video_context": current_vid or session.current_video_id
-    }
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Chat failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
 
+
+@app.post("/api/v2/chat/general")
+async def chat_general_tab(
+    user_input: ConversationInput,
+    current_user: dict = Depends(require_scope("write")),
+    db: Session = Depends(get_db)
+):
+    """
+    General tab conversation endpoint (cross-video queries).
+    
+    Features:
+    - Uses catalog-based video shortlisting for retrieval
+    - No specific video filter (searches across all user's videos)
+    - Stores conversation with video_id = "GENERAL"
+    - Includes citations with video titles
+    - Web search integration for time-sensitive queries
+    
+    Requires 'write' scope.
+    """
+    try:
+        # Check if Pinecone client is initialized
+        if pc is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Pinecone service is not available"
+            )
+        
+        # STEP 1: Get current user
+        user = db.query(User).filter(User.username == current_user["username"]).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # STEP 2: Get or create General conversation
+        import uuid as uuid_lib
+        
+        if user_input.conversation_id:
+            # Phase 5.14: Resume existing General conversation with validation
+            try:
+                # Debug logging (Phase 1.3): Log conversation retrieval
+                conv_uuid = uuid_lib.UUID(user_input.conversation_id)
+                if DEBUG_LOGGING:
+                    log_data = {
+                        "event": "conversation_retrieval",
+                        "conversation_id": str(conv_uuid),
+                        "user_id": str(user.id),
+                        "username": user.username,
+                        "endpoint": "/api/v2/chat/general",
+                        "timestamp": datetime.utcnow().isoformat()
+                    }
+                    logger.debug(f"[CHAT] Retrieving conversation: {json.dumps(log_data)}")
+                
+                # Phase 5.14: Use utility function for ownership verification
+                is_owner, error_msg = verify_conversation_ownership(db, conv_uuid, user.id)
+                
+                if not is_owner:
+                    # Phase 3.14: Enhanced error message for General conversation
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"General conversation {user_input.conversation_id} not found or you don't have access."
+                    )
+                
+                # Get conversation details
+                retrieval_start = time.time()
+                conversation = get_conversation_by_id(
+                    db,
+                    conv_uuid,
+                    user_id=user.id
+                )
+                retrieval_time = (time.time() - retrieval_start) * 1000
+                
+                if DEBUG_LOGGING:
+                    log_data["conversation_found"] = conversation is not None
+                    log_data["retrieval_time_ms"] = round(retrieval_time, 2)
+                    if conversation:
+                        log_data["video_id"] = conversation.video_id
+                    logger.debug(f"[CHAT] Conversation retrieval result: {json.dumps(log_data)}")
+                
+                if not conversation or conversation.video_id != "GENERAL":
+                    # Phase 3.14: Enhanced error message for General conversation
+                    if not conversation:
+                        error_msg = f"General conversation {user_input.conversation_id} not found or you don't have access."
+                    else:
+                        error_msg = f"Conversation {user_input.conversation_id} is not a General conversation (video_id: {conversation.video_id})."
+                    raise HTTPException(status_code=404, detail=error_msg)
+            except ValueError:
+                raise HTTPException(status_code=400, detail="Invalid conversation_id format")
+        else:
+            # Create or get General conversation
+            conversation = get_or_create_conversation(
+                db=db,
+                user_id=user.id,
+                video_id="GENERAL",
+                video_url="https://www.youtube.com/general",
+                video_title="General Questions"
+            )
+        
+        # Validate query
+        user_input.query = user_input.query.strip()
+        if not user_input.query:
+            raise HTTPException(status_code=400, detail="Query cannot be empty")
+        if len(user_input.query) > MAX_QUERY_LENGTH:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Query too long. Maximum {MAX_QUERY_LENGTH} characters allowed."
+            )
+        
+        # STEP 3: Get user namespace and indexes
+        index = get_shared_index()
+        namespace = get_user_namespace(user.username)
+        
+        # STEP 4: Build agent context from conversation history
+        recent_messages = get_recent_messages_for_context(
+            db, conversation.conversation_id, limit=10
+        )
+        
+        history = []
+        for msg in recent_messages:
+            if msg.role == 'user':
+                history.append(HumanMessage(content=msg.content))
+            elif msg.role == 'assistant':
+                history.append(AIMessage(content=msg.content))
+        
+        # STEP 5: Create General tab tools using factory functions
+        youtube_rag_tool_general = create_youtube_rag_tool_general(index, namespace)
+        google_search_tool_v2 = create_google_search_tool_v2()
+        
+        # Verify tools are properly structured (debugging aid)
+        tools = [youtube_rag_tool_general, google_search_tool_v2]
+        print(f"[DEBUG] Created {len(tools)} tools: {[tool.name if hasattr(tool, 'name') else type(tool).__name__ for tool in tools]}")
+        
+        # Create agent executor
+        agent = create_react_agent(model, tools, REACT_AGENT_PROMPT)
+        agent_executor = AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True,
+            max_iterations=5,  # Increased to allow proper answer synthesis from large contexts
+            handle_parsing_errors=True
+        )
+        
+        # Run agent with timeout
+        import asyncio
+        import time
+        
+        start_time = time.time()
+        timeout_seconds = 60.0
+        
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    agent_executor.invoke,
+                    {
+                        "input": user_input.query,
+                        "chat_history": history
+                    }
+                ),
+                timeout=timeout_seconds
+            )
+            
+            execution_time = time.time() - start_time
+            print(f"[TIMING] General tab execution completed in {execution_time:.2f} seconds")
+            
+            answer = result.get("output", "I couldn't generate an answer.")
+        
+        except asyncio.TimeoutError:
+            execution_time = time.time() - start_time
+            print(f"[ERROR] General tab execution timed out after {execution_time:.2f} seconds")
+            print(f"[ERROR] Query that timed out: {user_input.query[:100]}...")  # Log partial query for debugging
+            raise HTTPException(
+                status_code=504,
+                detail=f"Request timed out after {timeout_seconds} seconds"
+            )
+        
+        # STEP 7: Store conversation turn
+        user_msg, assistant_msg = insert_conversation_turn(
+            db=db,
+            conversation_id=conversation.conversation_id,
+            user_id=user.id,
+            video_id="GENERAL",
+            user_message=user_input.query,
+            assistant_message=answer
+        )
+        
+        # STEP 8: Return response
+        return ConversationResponse(
+            conversation_id=str(conversation.conversation_id),
+            video_id="GENERAL",
+            video_title=conversation.video_title,
+            user_message=user_input.query,
+            assistant_message=answer,
+            message_index=assistant_msg.message_index,
+            created_at=assistant_msg.created_at.isoformat()
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] General tab chat failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+
+@app.get("/chat/conversations/{conversation_id}/messages", response_model=List[ConversationMessageResponse])
+async def get_conversation_messages_endpoint(
+    conversation_id: str = Path(..., description="Conversation UUID"),
+    current_user: dict = Depends(require_scope("write")),
+    db: Session = Depends(get_db)
+):
+    """
+    Get all messages for a conversation in chronological order.
+    
+    Returns messages ordered by message_index ASC (0, 1, 2, 3...).
+    Requires 'write' scope.
+    
+    - Returns 404 if conversation doesn't exist
+    - Returns 403 if user doesn't own the conversation
+    - Returns empty array [] if conversation exists but has no messages
+    """
+    try:
+        import uuid as uuid_lib
+        
+        # Validate conversation_id format
+        try:
+            conv_uuid = uuid_lib.UUID(conversation_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid conversation_id format: {conversation_id}"
+            )
+        
+        # Get current user
+        user = db.query(User).filter(User.username == current_user["username"]).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # First check if conversation exists (without user_id filter)
+        conversation_exists = db.query(VideoConversation).filter(
+            VideoConversation.conversation_id == conv_uuid
+        ).first()
+        
+        if not conversation_exists:
+            # Phase 3.9: Enhanced 404 error message - conversation doesn't exist
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Conversation {conversation_id} not found. The conversation may have been deleted or never existed."
+            )
+        
+        # Phase 5.12: Use utility function for ownership verification
+        ownership_check_start = time.time()
+        is_owner, error_msg = verify_conversation_ownership(db, conv_uuid, user.id)
+        ownership_check_time = (time.time() - ownership_check_start) * 1000  # Convert to ms
+        
+        if not is_owner:
+            # Enhanced debug logging for 403 errors (Phase 1.1)
+            log_data = {
+                "event": "ownership_check_failed",
+                "conversation_id": str(conv_uuid),
+                "current_user_id": str(user.id),
+                "current_username": user.username,
+                "conversation_owner_id": str(conversation_exists.user_id) if conversation_exists else None,
+                "ownership_match": False,
+                "check_time_ms": round(ownership_check_time, 2),
+                "conversation_exists": conversation_exists is not None,
+                "video_id": conversation_exists.video_id if conversation_exists else None,
+                "video_title": conversation_exists.video_title[:100] if conversation_exists else None,  # Truncate for logging
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            logger.warning(f"[AUTH] Ownership check failed: {json.dumps(log_data)}")
+            
+            # Phase 3.8: Enhanced 403 error message with diagnostic information
+            owner_id_str = str(conversation_exists.user_id) if conversation_exists else "unknown"
+            error_detail = (
+                f"Access denied: Conversation {conversation_id} belongs to a different user. "
+                f"Current user: {user.username} (ID: {str(user.id)}), "
+                f"Conversation owner ID: {owner_id_str}. "
+                f"If you believe this is an error, please contact support with this conversation ID."
+            )
+            
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=error_detail
+            )
+        
+        # Get conversation for further processing
+        conversation = conversation_exists
+        
+        # Log successful ownership check (Phase 1.1)
+        if DEBUG_LOGGING:
+            log_data = {
+                "event": "ownership_check_success",
+                "conversation_id": str(conv_uuid),
+                "current_user_id": str(user.id),
+                "current_username": user.username,
+                "conversation_owner_id": str(conversation.user_id),
+                "ownership_match": True,
+                "check_time_ms": round(ownership_check_time, 2),
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            logger.debug(f"[AUTH] Ownership check success: {json.dumps(log_data)}")
+        
+        # Get all messages for this conversation (ordered by message_index ASC)
+        # get_conversation_messages already orders by message_index ASC
+        messages = get_conversation_messages(
+            db=db,
+            conversation_id=conv_uuid,
+            limit=None,  # Get all messages
+            offset=None
+        )
+        
+        # Serialize messages for API response
+        result = []
+        for msg in messages:
+            serialized = serialize_message_for_api(msg)
+            result.append(serialized)
+        
+        # Return empty array if no messages (conversation exists but is empty)
+        return result
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch conversation messages for {conversation_id}: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch messages"
+        )
 
 

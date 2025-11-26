@@ -37,7 +37,10 @@ from sqlalchemy import (
     Text,
     ForeignKey,
     CheckConstraint,
+    Index,
+    UniqueConstraint,
 )
+import sqlalchemy as sa
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 import uuid
@@ -121,76 +124,124 @@ class User(Base):
         return f"<User(username='{self.username}', email='{self.email}')>"
 
 
-class UserSession(Base):
+class VideoConversation(Base):
     """
-    User session model for agent conversation context.
-    Tracks current video context and session state.
+    Video conversation model (Schema 2 - parent table).
+    One row per (user, video) conversation for fast tab rendering.
     """
-    __tablename__ = "user_sessions"
+    __tablename__ = "video_conversations"
     
-    # Identity
-    session_id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
-    user_id = Column(UUID_TYPE, ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    # Primary key
+    conversation_id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
     
-    # Video context tracking (critical for follow-up questions)
-    current_video_id = Column(String(100), nullable=True)
-    current_video_url = Column(Text, nullable=True)
+    # Foreign key to users
+    user_id = Column(UUID_TYPE, ForeignKey('users.id', ondelete='CASCADE'), nullable=False, index=True)
     
-    # Session lifecycle
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    last_activity = Column(DateTime, default=datetime.utcnow, nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
-    expires_at = Column(DateTime, default=lambda: datetime.utcnow() + timedelta(hours=24), nullable=False)
+    # Video identification
+    video_id = Column(String(11), nullable=False, index=True)
+    video_url = Column(Text, nullable=False)
+    video_title = Column(String(500), nullable=False)
     
-    def __repr__(self):
-        return f"<UserSession(session_id='{self.session_id}', user_id='{self.user_id}', active={self.is_active})>"
-
-
-class Message(Base):
-    """
-    Message model for conversation history (sliding window).
-    Maintains last 20 messages per session for agent context.
-    """
-    __tablename__ = "messages"
+    # Timestamps (timezone=True for PostgreSQL TIMESTAMPTZ)
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    last_message_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False, index=True)
     
-    # Identity
-    id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
-    session_id = Column(UUID_TYPE, ForeignKey('user_sessions.session_id', ondelete='CASCADE'), nullable=False)
+    # Denormalized previews and counters
+    message_count = Column(Integer, default=0, nullable=False)
+    last_user_message = Column(Text, nullable=True)
+    last_assistant_message = Column(Text, nullable=True)
     
-    # Ordering (critical for conversation flow)
-    message_index = Column(Integer, nullable=False)
+    # Retention control
+    is_pinned = Column(Boolean, default=False, nullable=False, index=True)
     
-    # Message content
-    message_type = Column(String(10), nullable=False)  # 'human', 'ai', 'system', 'tool'
-    content = Column(Text, nullable=False)
-    
-    # Context tracking
-    video_id = Column(String(100), nullable=True)
-    
-    # Tool tracking (for debugging)
-    tool_name = Column(String(100), nullable=True)
-    tool_success = Column(Boolean, nullable=True)
-    
-    # Flexible metadata (using extra_data to avoid SQLAlchemy reserved word)
-    extra_data = Column(EXTRA_DATA_TYPE, default=dict, nullable=False)
-    
-    # Timestamp
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    # Optional: General tab routing cache
+    synopsis_preview = Column(Text, nullable=True)
     
     # Constraints
     __table_args__ = (
+        sa.UniqueConstraint('user_id', 'video_id', name='uq_user_video'),
+    )
+    
+    def __repr__(self):
+        return f"<VideoConversation(conversation_id='{self.conversation_id}', user_id='{self.user_id}', video_id='{self.video_id}')>"
+
+
+class ConversationMessage(Base):
+    """
+    Conversation message model (Schema 2 - child table).
+    Stores all messages for a conversation in chronological order.
+    """
+    __tablename__ = "conversation_messages"
+    
+    # Primary key
+    id = Column(UUID_TYPE, primary_key=True, default=uuid_default)
+    
+    # Foreign key to parent conversation
+    conversation_id = Column(
+        UUID_TYPE, 
+        ForeignKey('video_conversations.conversation_id', ondelete='CASCADE'), 
+        nullable=False
+    )
+    
+    # Denormalized fields (for direct queries without joins)
+    user_id = Column(UUID_TYPE, nullable=False, index=True)
+    video_id = Column(String(11), nullable=False, index=True)
+    
+    # Message ordering
+    message_index = Column(Integer, nullable=False)
+    
+    # Message content
+    role = Column(String(10), nullable=False)  # 'user', 'assistant', 'system'
+    content = Column(Text, nullable=False)
+    content_length = Column(Integer, nullable=False)
+    tokens_estimate = Column(Integer, nullable=True)
+    
+    # Timestamp
+    created_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    
+    # Constraints
+    __table_args__ = (
+        sa.UniqueConstraint('conversation_id', 'message_index', name='uq_conversation_message_index'),
         CheckConstraint(
-            "message_type IN ('human', 'ai', 'system', 'tool')",
-            name='check_message_type'
-        ),
-        CheckConstraint(
-            "(message_type = 'tool' AND tool_name IS NOT NULL) OR (message_type != 'tool')",
-            name='check_tool_fields'
+            "role IN ('user', 'assistant', 'system')",
+            name='check_role_valid'
         ),
     )
     
     def __repr__(self):
-        return f"<Message(type='{self.message_type}', index={self.message_index}, session='{self.session_id}')>"
+        return f"<ConversationMessage(id='{self.id}', conversation_id='{self.conversation_id}', role='{self.role}', index={self.message_index})>"
+
+
+class VideosCatalog(Base):
+    """
+    Videos catalog model (authoritative per-video metadata).
+    Single source of truth for video synopsis and topics used in General tab routing.
+    """
+    __tablename__ = "videos_catalog"
+    
+    # Primary key
+    video_id = Column(String(11), primary_key=True)
+    
+    # Video metadata
+    video_title = Column(String(500), nullable=False)
+    channel_title = Column(String(300), nullable=True)
+    published_at = Column(DateTime(timezone=True), nullable=True)
+    video_url = Column(Text, nullable=False)
+    
+    # Routing metadata
+    synopsis = Column(Text, nullable=False)
+    topics = Column(ARRAY(String) if not IS_SQLITE else JSON, nullable=False)
+    
+    # Embedding tracking (optional)
+    embedding_version = Column(String(50), nullable=True)
+    last_embedded_at = Column(DateTime(timezone=True), nullable=True)
+    
+    # Refresh tracking
+    last_refreshed_at = Column(DateTime(timezone=True), default=datetime.utcnow, nullable=False)
+    
+    def __repr__(self):
+        return f"<VideosCatalog(video_id='{self.video_id}', title='{self.video_title[:50]}...')>"
+
 
 # Dependency to get database session
 def get_db() -> Session:
@@ -210,3 +261,4 @@ def create_tables():
 def drop_tables():
     """Drop all database tables"""
     Base.metadata.drop_all(bind=engine)
+
